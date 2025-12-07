@@ -1,4 +1,7 @@
+import base64
+import json
 import textwrap
+from pathlib import Path
 from typing import List, Optional
 
 import requests
@@ -6,6 +9,26 @@ import viktor as vkt
 
 
 AEC_GRAPHQL_URL = "https://developer.api.autodesk.com/aec/graphql"
+
+
+ELEMENTS_BY_TYPE_QUERY = """
+query ElementsByType($elementGroupId: ID!, $rsqlFilter: String!, $pagination: PaginationInput) {
+    elementsByElementGroup(
+        elementGroupId: $elementGroupId
+        filter: { query: $rsqlFilter }
+        pagination: $pagination
+    ) {
+        pagination { cursor pageSize }
+        results {
+            id
+            name
+            alternativeIdentifiers {
+                externalElementId
+            }
+        }
+    }
+}
+"""
 
 
 def execute_graphql(query: str, token: str, region: str, variables: Optional[dict] = None, timeout: int = 30) -> dict:
@@ -27,6 +50,56 @@ def execute_graphql(query: str, token: str, region: str, variables: Optional[dic
         raise RuntimeError(f"GraphQL errors: {body['errors']}")
 
     return body.get("data", {})
+
+
+def fetch_elements_by_type(
+    *,
+    element_group_id: str,
+    token: str,
+    region: str,
+    family_name: Optional[str],
+    element_name: str,
+    page_limit: int = 200,
+) -> List[dict]:
+    """Return all instance elements that match the given family and element (type) name.
+
+    Filters on Element Context == Instance, Element Name, and optionally Family Name.
+    Returns a list of dicts containing id, name, and alternativeIdentifiers.externalElementId.
+    """
+
+    family_safe = family_name.replace("'", "\\'") if family_name else None
+    element_safe = element_name.replace("'", "\\'")
+
+    rsql_parts = ["'property.name.Element Context'==Instance"]
+    if family_safe:
+        rsql_parts.append(f"'property.name.Family Name'=='{family_safe}'")
+    rsql_parts.append(f"'property.name.Element Name'=='{element_safe}'")
+    rsql_filter = " and ".join(rsql_parts)
+
+    results: List[dict] = []
+    cursor: Optional[str] = None
+    page = 1
+
+    while True:
+        vkt.progress_message(message=f"Fetching instances for '{element_name}' (page {page})")
+        variables = {
+            "elementGroupId": element_group_id,
+            "rsqlFilter": rsql_filter,
+            "pagination": {"limit": page_limit} if not cursor else {"cursor": cursor, "limit": page_limit},
+        }
+        data = execute_graphql(ELEMENTS_BY_TYPE_QUERY, token=token, region=region, variables=variables)
+        block = data.get("elementsByElementGroup") or {}
+        page_results = block.get("results") or []
+        results.extend(page_results)
+
+        pagination = block.get("pagination") or {}
+        new_cursor = pagination.get("cursor")
+        if not new_cursor or new_cursor == cursor or len(page_results) == 0:
+            break
+        cursor = new_cursor
+        page += 1
+
+    return results
 
 
 def get_model_info(params, **kwargs) -> Optional[dict]:
@@ -209,9 +282,9 @@ class Parametrization(vkt.Parametrization):
             """
         )
     )
-    parameter_section.parameter_table = vkt.Table(name="Parameter to Assign")
+    parameter_section.parameter_table = vkt.Table("Parameter to Assign")
     parameter_section.parameter_table.parameter_name = vkt.TextField("Parameter Name")
-    parameter_section.parameter_table.visualize = vkt.BooleanField("Visualize", default=True)
+    parameter_section.parameter_table.visualize = vkt.BooleanField("Visualize") 
 
     assignments_section = vkt.Section("Assignments")
     assignments_section.title = vkt.Text(
@@ -223,8 +296,8 @@ class Parametrization(vkt.Parametrization):
         )
     )
     assignments_section.assignments = vkt.DynamicArray("Assignments", default=[{}], copylast=True)
-    assignments_section.assignments.family = vkt.OptionField(
-        "Family Name", options=get_family_options, autoselect_single_option=True
+    assignments_section.assignments.family = vkt.AutocompleteField(
+        "Family Name", options=get_family_options
     )
     assignments_section.assignments.type_name = vkt.OptionField(
         "Type (Element Name)", options=get_type_options, autoselect_single_option=True
@@ -238,10 +311,22 @@ class Parametrization(vkt.Parametrization):
     )
 
 
+def _encode_urn(raw_urn: str) -> str:
+    """Return urlsafe base64 encoding without padding for Forge URNs."""
+
+    return base64.urlsafe_b64encode(raw_urn.encode()).decode().rstrip("=")
+
+
+def _color_to_hex(color: Optional[vkt.Color]) -> str:
+    """Return hex string for viktor Color, fallback to blue if None."""
+
+    return color.hex if color else "#0099ff"
+
+
 class Controller(vkt.Controller):
     parametrization = Parametrization
 
-    @vkt.AutodeskView("Autodesk Model", duration_guess=20)
+    @vkt.WebView("Autodesk Model", duration_guess=30)
     def autodesk_view(self, params, **kwargs):
         info = get_model_info(params, **kwargs)
         if not info:
@@ -253,4 +338,49 @@ class Controller(vkt.Controller):
             f"Launching viewer with {len(params_rows)} parameter rows and {len(assignments)} assignment rows."
         )
 
-        return vkt.AutodeskResult(info["file"], access_token=info["token"])
+        version = info["file"].get_latest_version(info["token"])
+        urn_bs64 = _encode_urn(version.urn)
+
+        visible_params = {
+            row.get("parameter_name")
+            for row in params_rows
+            if row.get("parameter_name") and row.get("visualize")
+        }
+
+        external_id_color_map = {}
+        for row in assignments:
+            type_name = row.get("type_name")
+            if not type_name:
+                continue
+            param_name = row.get("parameter")
+            if not param_name or param_name not in visible_params:
+                continue
+            family_name = row.get("family")
+            color_hex = _color_to_hex(row.get("color"))
+
+            try:
+                elements = fetch_elements_by_type(
+                    element_group_id=info["element_group_id"],
+                    token=info["token"],
+                    region=info["region"],
+                    family_name=family_name,
+                    element_name=type_name,
+                )
+            except Exception as exc:
+                vkt.UserMessage.warning(f"Failed to fetch instances for {type_name}: {exc}")
+                continue
+
+            for element in elements:
+                alt = (element.get("alternativeIdentifiers") or {}).get("externalElementId")
+                if alt:
+                    external_id_color_map[alt] = color_hex
+
+        external_ids = [{ext_id: color} for ext_id, color in external_id_color_map.items()]
+
+        html_path = Path(__file__).resolve().parent / "ApsViewer.html"
+        html = html_path.read_text(encoding="utf-8")
+        html = html.replace("APS_TOKEN_PLACEHOLDER", info["token"])
+        html = html.replace("URN_PLACEHOLDER", urn_bs64)
+        html = html.replace("EXTERNAL_IDS_PLACEHOLDER", json.dumps(external_ids))
+
+        return vkt.WebResult(html=html)
