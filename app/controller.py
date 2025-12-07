@@ -296,7 +296,7 @@ class Parametrization(vkt.Parametrization):
         )
     )
     assignments_section.assignments = vkt.DynamicArray("Assignments", default=[{}], copylast=True)
-    assignments_section.assignments.family = vkt.OptionField(
+    assignments_section.assignments.family = vkt.AutocompleteField(
         "Family Name", options=get_family_options, autoselect_single_option=True
     )
     assignments_section.assignments.type_name = vkt.OptionField(
