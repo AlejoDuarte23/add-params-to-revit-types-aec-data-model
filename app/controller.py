@@ -297,7 +297,7 @@ class Parametrization(vkt.Parametrization):
     )
     assignments_section.assignments = vkt.DynamicArray("Assignments", default=[{}], copylast=True)
     assignments_section.assignments.family = vkt.AutocompleteField(
-        "Family Name", options=get_family_options, autoselect_single_option=True
+        "Family Name", options=get_family_options
     )
     assignments_section.assignments.type_name = vkt.OptionField(
         "Type (Element Name)", options=get_type_options, autoselect_single_option=True
@@ -341,10 +341,19 @@ class Controller(vkt.Controller):
         version = info["file"].get_latest_version(info["token"])
         urn_bs64 = _encode_urn(version.urn)
 
+        visible_params = {
+            row.get("parameter_name")
+            for row in params_rows
+            if row.get("parameter_name") and row.get("visualize")
+        }
+
         external_id_color_map = {}
         for row in assignments:
             type_name = row.get("type_name")
             if not type_name:
+                continue
+            param_name = row.get("parameter")
+            if not param_name or param_name not in visible_params:
                 continue
             family_name = row.get("family")
             color_hex = _color_to_hex(row.get("color"))
