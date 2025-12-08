@@ -11,6 +11,16 @@ import viktor as vkt
 DX_GRAPHQL_URL = "https://developer.api.autodesk.com/dataexchange/2023-05/graphql"
 
 
+EXCHANGE_BY_FILE_URN_QUERY = """
+query GetExchangeByFileUrn($externalProjectId: ID!, $fileUrn: ID!) {
+    exchangeByFileUrn(externalProjectId: $externalProjectId, fileUrn: $fileUrn) {
+        id
+        name
+    }
+}
+"""
+
+
 ELEMENTS_WITH_PROPS_QUERY = """
 query ElementsWithProps($exchangeId: ID!, $pagination: PaginationInput) {
     exchange(exchangeId: $exchangeId) {
@@ -36,7 +46,6 @@ query ElementsWithProps($exchangeId: ID!, $pagination: PaginationInput) {
 }
 """
 
-
 def execute_graphql(query: str, *, token: str, region: str, variables: Optional[dict] = None, timeout: int = 30) -> dict:
     """Execute a GraphQL query against the Data Exchange API."""
 
@@ -58,7 +67,7 @@ def execute_graphql(query: str, *, token: str, region: str, variables: Optional[
     return body.get("data", {})
 
 
-def _extract_props(prop_results: Optional[dict]) -> Dict[str, Optional[str]]:
+def extract_props(prop_results: Optional[dict]) -> Dict[str, Optional[str]]:
     """Convert GraphQL property results into a flat dict of name -> value."""
 
     properties = {}
@@ -70,10 +79,10 @@ def _extract_props(prop_results: Optional[dict]) -> Dict[str, Optional[str]]:
     return properties
 
 
-_ELEMENT_CACHE: Dict[str, List[dict]] = {}
+ELEMENT_CACHE: Dict[str, List[dict]] = {}
 
 
-def _fetch_elements_catalog(*, exchange_id: str, token: str, region: str, page_size: int = 200) -> List[dict]:
+def fetch_elements_catalog(*, exchange_id: str, token: str, region: str, page_size: int = 200) -> List[dict]:
     """Fetch all elements once, capturing family, type, and external IDs."""
 
     catalog: List[dict] = []
@@ -92,16 +101,15 @@ def _fetch_elements_catalog(*, exchange_id: str, token: str, region: str, page_s
         results = elements_block.get("results") or []
 
         for element in results:
-            props = _extract_props(element.get("properties"))
+            props = extract_props(element.get("properties"))
             family_name = props.get("Family Name")
             element_name = props.get("Element Name")
 
-            ext_id = None
-            for alt in element.get("alternativeIdentifiers") or []:
-                candidate = alt.get("externalElementId")
-                if candidate:
-                    ext_id = str(candidate)
-                    break
+            alt_ids = element.get("alternativeIdentifiers") or {}
+            ext_id = alt_ids.get("externalElementId")
+            if ext_id:
+                ext_id = str(ext_id)
+                print(f"externalElementId found: {ext_id}")
 
             catalog.append(
                 {
@@ -123,19 +131,32 @@ def _fetch_elements_catalog(*, exchange_id: str, token: str, region: str, page_s
     return catalog
 
 
+@vkt.memoize
 def get_elements_catalog(*, exchange_id: str, token: str, region: str) -> List[dict]:
     """Return cached catalog of elements for the exchange id."""
 
-    if exchange_id in _ELEMENT_CACHE:
-        return _ELEMENT_CACHE[exchange_id]
+    if exchange_id in ELEMENT_CACHE:
+        return ELEMENT_CACHE[exchange_id]
 
-    catalog = _fetch_elements_catalog(exchange_id=exchange_id, token=token, region=region)
-    _ELEMENT_CACHE[exchange_id] = catalog
+    catalog = fetch_elements_catalog(exchange_id=exchange_id, token=token, region=region)
+    ELEMENT_CACHE[exchange_id] = catalog
     return catalog
 
 
+def fetch_exchange_id(*, project_id: str, file_urn: str, token: str, region: str) -> str:
+    """Resolve exchange id via exchangeByFileUrn."""
+
+    variables = {"externalProjectId": project_id, "fileUrn": file_urn}
+    data = execute_graphql(EXCHANGE_BY_FILE_URN_QUERY, token=token, region=region, variables=variables)
+    exchange = (data or {}).get("exchangeByFileUrn") or {}
+    exch_id = exchange.get("id")
+    if not exch_id:
+        raise vkt.UserError("No exchange id found for the selected file/project.")
+    return exch_id
+
+
 def get_model_info(params, **kwargs) -> Optional[dict]:
-    """Return token, region, exchange id, and file if an Autodesk file is selected."""
+    """Return token, region, exchange id, viewer URN, and file if an Autodesk file is selected."""
 
     autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
     if not autodesk_file:
@@ -144,11 +165,18 @@ def get_model_info(params, **kwargs) -> Optional[dict]:
     integration = vkt.external.OAuth2Integration("aps-integration-viktor")
     token = integration.get_access_token()
     region = autodesk_file.get_region(token)
-    #version = autodesk_file.get_latest_version(token)
-    urn = autodesk_file.urn
-    print(f"{urn=}")
-    exchange_id = _encode_urn(urn)
-    print(f"{exchange_id=}")
+    version = autodesk_file.get_latest_version(token)
+    viewer_urn_bs64 = _encode_urn(version.urn)
+
+    project_id = getattr(autodesk_file, "project_id", None)
+    if not project_id:
+        raise vkt.UserError("Project id is missing on the selected Autodesk file.")
+
+    file_urn = getattr(autodesk_file, "urn", None)
+    if not file_urn:
+        raise vkt.UserError("URN is missing on the selected Autodesk file.")
+
+    exchange_id = fetch_exchange_id(project_id=project_id, file_urn=file_urn, token=token, region=region)
 
     model_name = getattr(autodesk_file, "name", None) or "selected model"
     vkt.UserMessage.info(
@@ -159,10 +187,12 @@ def get_model_info(params, **kwargs) -> Optional[dict]:
         "token": token,
         "region": region,
         "exchange_id": exchange_id,
+        "urn_bs64": viewer_urn_bs64,
         "file": autodesk_file,
     }
 
 
+@vkt.memoize
 def get_family_list(*, exchange_id: str, token: str, region: str) -> List[str]:
     """Return sorted distinct family names from the cached catalog."""
 
@@ -171,6 +201,7 @@ def get_family_list(*, exchange_id: str, token: str, region: str) -> List[str]:
     return sorted(families)
 
 
+@vkt.memoize
 def get_types_for_family(*, exchange_id: str, token: str, region: str, family_name: str) -> List[str]:
     """Return sorted distinct element names for a given family from the cached catalog."""
 
@@ -313,7 +344,7 @@ class Controller(vkt.Controller):
             f"Launching viewer with {len(params_rows)} parameter rows and {len(assignments)} assignment rows."
         )
 
-        urn_bs64 = info["exchange_id"]
+        urn_bs64 = info.get("urn_bs64") or info.get("exchange_id")
         catalog = get_elements_catalog(
             exchange_id=info["exchange_id"],
             token=info["token"],
