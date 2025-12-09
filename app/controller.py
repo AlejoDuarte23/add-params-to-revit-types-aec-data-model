@@ -1,14 +1,33 @@
 import base64
 import json
 import textwrap
+import time
+import uuid
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 import viktor as vkt
+from aps_automation_sdk.acc import parent_folder_from_item
+from aps_automation_sdk.classes import (
+    ActivityInputParameterAcc,
+    ActivityJsonParameter,
+    ActivityOutputParameterAcc,
+    WorkItemAcc,
+)
+from dotenv import load_dotenv
+
+from app.helpers import (
+    DEFAULT_REVIT_VERSION,
+    fetch_manifest,
+    get_revit_version_from_manifest,
+    get_type_parameters_signature,
+)
 
 
 DX_GRAPHQL_URL = "https://developer.api.autodesk.com/dataexchange/2023-05/graphql"
+DA_V3 = "https://developer.api.autodesk.com/da/us-east/v3"
 
 
 EXCHANGE_BY_FILE_URN_QUERY = """
@@ -45,6 +64,55 @@ query ElementsWithProps($exchangeId: ID!, $pagination: PaginationInput) {
     }
 }
 """
+
+
+load_dotenv()
+
+
+def bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_workitem_status(wi_id: str, token: str) -> Dict[str, Any]:
+    url = f"{DA_V3}/workitems/{wi_id}"
+    resp = requests.get(url, headers=bearer(token), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_type_params_json(params) -> List[Dict[str, Any]]:
+    """Group assignments by parameter + group into DA config payload."""
+
+    rows = getattr(getattr(params, "assignments_section", None), "assignments", None) or []
+    grouped: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+
+    for row in rows:
+        param_name = row.get("parameter")
+        if not param_name:
+            continue
+        param_group = row.get("parameter_group") or "PG_DATA"
+        target = {
+            "TypeName": row.get("type_name") or "",
+            "FamilyName": row.get("family") or "",
+            "Value": row.get("parameter_value") or "",
+        }
+        grouped[(param_name, param_group)].append(target)
+
+    payload: List[Dict[str, Any]] = []
+    for (name, group), targets in grouped.items():
+        if not name:
+            continue
+        if not targets:
+            continue
+        payload.append(
+            {
+                "ParameterName": name,
+                "ParameterGroup": group,
+                "Targets": targets,
+            }
+        )
+
+    return payload
 
 def execute_graphql(query: str, *, token: str, region: str, variables: Optional[dict] = None, timeout: int = 30) -> dict:
     """Execute a GraphQL query against the Data Exchange API."""
@@ -162,7 +230,7 @@ def get_model_info(params, **kwargs) -> Optional[dict]:
     if not autodesk_file:
         return None
 
-    integration = vkt.external.OAuth2Integration("aps-integration-viktor")
+    integration = vkt.external.OAuth2Integration("aps-integration-automation-v2")
     token = integration.get_access_token()
     region = autodesk_file.get_region(token)
     version = autodesk_file.get_latest_version(token)
@@ -276,7 +344,7 @@ class Parametrization(vkt.Parametrization):
     )
     model.autodesk_file = vkt.AutodeskFileField(
         "Revit model",
-        oauth2_integration="aps-integration-viktor",
+        oauth2_integration="aps-integration-automation-v2",
     )
 
     parameter_section = vkt.Section("Parameter Table")
@@ -311,10 +379,31 @@ class Parametrization(vkt.Parametrization):
     assignments_section.assignments.parameter = vkt.OptionField(
         "Parameter Name", options=get_parameter_options, autoselect_single_option=True
     )
+    assignments_section.assignments.parameter_group = vkt.OptionField(
+        "Parameter Group",
+        options=["PG_TEXT", "PG_DATA", "PG_IDENTITY_DATA", "PG_GEOMETRY"],
+        autoselect_single_option=True,
+    )
     assignments_section.assignments.parameter_value = vkt.TextField("Parameter Value")
     assignments_section.assignments.color = vkt.ColorField(
         "Color", default=vkt.Color(0, 153, 255)
     )
+
+    run_automation = vkt.Section("Run Automation")
+    run_automation.title = vkt.Text(
+        textwrap.dedent(
+            """\
+            ## Run Automation
+            Select a model and trigger the automation workflow (coming soon).
+            """
+        )
+    )
+    run_automation.autodesk_file = vkt.AutodeskFileField(
+        "Revit model",
+        oauth2_integration="aps-integration-automation-v2",
+    )
+    run_automation.break_line = vkt.LineBreak()
+    run_automation.trigger = vkt.ActionButton("Run Automation", method="trigger_run_automation")
 
 
 def _encode_urn(raw_urn: str) -> str:
@@ -393,3 +482,131 @@ class Controller(vkt.Controller):
         html = html.replace("EXTERNAL_IDS_PLACEHOLDER", json.dumps(external_ids))
 
         return vkt.WebResult(html=html)
+
+    def trigger_run_automation(self, params, **kwargs):
+        """Run DA to add parameters to Revit types via ACC."""
+
+        integration = vkt.external.OAuth2Integration("aps-integration-automation-v2")
+        token = integration.get_access_token()
+
+        autodesk_file = getattr(getattr(params, "run_automation", None), "autodesk_file", None)
+        if not autodesk_file:
+            raise vkt.UserError("Select a model in the Run Automation section first")
+
+        project_id = getattr(autodesk_file, "project_id", None)
+        file_urn = getattr(autodesk_file, "urn", None)
+        if not project_id or not file_urn:
+            raise vkt.UserError("Missing project id or URN for the selected Autodesk file.")
+
+        vkt.UserMessage.info("Starting Design Automation workflow...")
+        vkt.progress_message("Preparing files...", percentage=5)
+
+        version = autodesk_file.get_latest_version(token)
+        attrs = getattr(version, "attributes", {}) or {}
+        display_name = attrs.get("displayName", "model")
+
+        try:
+            manifest = fetch_manifest(autodesk_file, token)
+            revit_version = get_revit_version_from_manifest(manifest) or DEFAULT_REVIT_VERSION
+            vkt.UserMessage.info(f"Detected Revit version: {revit_version}")
+        except Exception as exc:  # noqa: BLE001
+            revit_version = DEFAULT_REVIT_VERSION
+            vkt.UserMessage.info(f"Could not detect Revit version ({exc}); using default {revit_version}")
+
+        signature, activity_full_alias = get_type_parameters_signature(revit_version)
+
+        input_revit = ActivityInputParameterAcc(
+            name="rvtFile",
+            localName="input.rvt",
+            verb="get",
+            description="Input Revit File",
+            required=True,
+            is_engine_input=True,
+            project_id=project_id,
+            linage_urn=file_urn,
+        )
+
+        folder_id = parent_folder_from_item(
+            project_id=project_id,
+            item_id=file_urn,
+            token=token,
+        )
+
+        type_params_config = create_type_params_json(params)
+        if not type_params_config:
+            raise vkt.UserError("Add at least one assignment with a parameter to run automation.")
+
+        input_json = ActivityJsonParameter(
+            name="configJson",
+            file_name="revit_type_params.json",
+            localName="revit_type_params.json",
+            verb="get",
+            description="Type parameter JSON configuration",
+        )
+        input_json.set_content(type_params_config)
+
+        short_uuid = uuid.uuid4().hex[:8]
+        output_filename = f"{display_name}_{short_uuid}.rvt"
+        output_file = ActivityOutputParameterAcc(
+            name="result",
+            localName="output.rvt",
+            verb="put",
+            description="Result Revit model with added parameters",
+            folder_id=folder_id,
+            project_id=project_id,
+            file_name=output_filename,
+        )
+
+        workitem = WorkItemAcc(
+            parameters=[input_revit, input_json, output_file],
+            activity_full_alias=activity_full_alias,
+        )
+
+        vkt.UserMessage.info("Creating work item...")
+        vkt.progress_message("Running Design Automation...", percentage=35)
+        workitem_id = workitem.run_public_activity(
+            token3lo=token,
+            activity_signature=signature,
+        )
+        vkt.UserMessage.info(f"Workitem ID: {workitem_id}")
+
+        elapsed = 0
+        poll_interval = 10
+        max_wait = 600
+        final_status = None
+        report_url = None
+
+        while elapsed <= max_wait:
+            status_payload = get_workitem_status(workitem_id, token)
+            final_status = status_payload.get("status")
+            report_url = status_payload.get("reportUrl")
+            pct = min(35 + int((elapsed / max_wait) * 55), 90)
+            vkt.progress_message(f"Work item status: {final_status} [{elapsed}s] {report_url=}...", percentage=pct)
+            print(report_url)
+            if final_status in ("success", "failed", "cancelled"):
+                if final_status in ("failed", "cancelled") and report_url:
+                    print(f"Work item {final_status}. Report URL: {report_url}")
+                break
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        if final_status != "success":
+            msg = f"Automation did not finish with success. Status: {final_status}"
+            if report_url:
+                msg += f"\nReport URL: {report_url}"
+            raise vkt.UserError(msg)
+
+        output_file.create_acc_item(token=token)
+        vkt.progress_message("Updated model ready for viewing!", percentage=100)
+
+        total_targets = sum(len(entry.get("Targets", [])) for entry in type_params_config)
+        success_msg = (
+            "Automation completed successfully!\n\n"
+            f"Parameters configured: {len(type_params_config)}\n"
+            f"Total targets: {total_targets}\n"
+            f"Workitem ID: {workitem_id}"
+        )
+        if report_url:
+            success_msg += f"\nReport URL: {report_url}"
+
+        vkt.UserMessage.success(success_msg)

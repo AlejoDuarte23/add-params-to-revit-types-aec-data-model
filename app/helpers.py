@@ -48,82 +48,56 @@ def fetch_manifest(autodesk_file_param, token):
     resp.raise_for_status()
     return resp.json()
 
-TYPE_PARAMETERS_CONFIG = {
-    "2023": {
-        "signature": os.getenv("TypeParametersActivity2023", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_TypeParameters2023", ""),
-    },
-    "2024": {
-        "signature": os.getenv("TypeParametersActivity2024", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_TypeParameters2024", ""),
-    },
-    "2025": {
-        "signature": os.getenv("TypeParametersActivity2025", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_TypeParameters2025", ""),
-    },
-    "2026": {
-        "signature": os.getenv("TypeParametersActivity2026", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_TypeParameters2026", ""),
-    }
-}
-
-# IFC Export version to activity/engine mapping
-# Based on the activities created in autodesk_automation - ExportIFC/create_activities_by_revit_version.ipynb
-IFC_EXPORT_VERSION_CONFIG = {
-    "2023": {
-        "signature": os.getenv("RevitIfcExportAppActivity2023", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_IfcExport2023", ""),
-    },
-    "2024": {
-        "signature": os.getenv("RevitIfcExportAppActivity2024", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_IfcExport2024", ""),
-    },
-    "2025": {
-        "signature": os.getenv("RevitIfcExportAppActivity2025", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_IfcExport2025", ""),
-    },
-    "2026": {
-        "signature": os.getenv("RevitIfcExportAppActivity2026", ""),
-        "activity_full_alias": os.getenv("ACTIVITY_FULL_ALIAS_IfcExport2026", ""),
-    }
-}
-
-
+# Supported Revit versions for Design Automation
+SUPPORTED_REVIT_VERSIONS = ["2023", "2024", "2025", "2026"]
 
 # Default to 2024 if version cannot be detected
 DEFAULT_REVIT_VERSION = "2024"
 
 
-def get_type_parameters_signature(revit_version: str | None) -> tuple[str, str]:
+def get_type_parameters_config(revit_version: str) -> tuple[str, str]:
     """Get the activity signature and full alias for TypeParameters based on Revit version.
     
-    Returns:
-        tuple: (signature, activity_full_alias)
-    
-    Raises:
-        ValueError: If the Revit version is not supported.
-    """
-    if revit_version not in TYPE_PARAMETERS_CONFIG:
-        supported = ", ".join(TYPE_PARAMETERS_CONFIG.keys())
-        raise ValueError(f"Revit version '{revit_version}' is not supported. Supported versions: {supported}")
-    config = TYPE_PARAMETERS_CONFIG[revit_version]
-    return config["signature"], config["activity_full_alias"]
-
-
-def get_ifc_export_signature(revit_version: str | None) -> tuple[str, str]:
-    """Get the activity signature and full alias for IFC Export based on Revit version.
+    Args:
+        revit_version: The Revit version string (e.g., "2023", "2024", "2025", "2026")
     
     Returns:
         tuple: (signature, activity_full_alias)
+            - signature: The long base64 signature string for run_public_activity()
+            - activity_full_alias: The activity ID like "nickname.ActivityName+alias" for WorkItemAcc()
     
     Raises:
-        ValueError: If the Revit version is not supported.
+        ValueError: If the Revit version is not supported or env vars are missing.
     """
-    if revit_version not in IFC_EXPORT_VERSION_CONFIG:
-        supported = ", ".join(IFC_EXPORT_VERSION_CONFIG.keys())
-        raise ValueError(f"Revit version '{revit_version}' is not supported for IFC export. Supported versions: {supported}")
-    config = IFC_EXPORT_VERSION_CONFIG[revit_version]
-    return config["signature"], config["activity_full_alias"]
+    if revit_version not in SUPPORTED_REVIT_VERSIONS:
+        raise ValueError(
+            f"Revit version '{revit_version}' is not supported. "
+            f"Supported versions: {', '.join(SUPPORTED_REVIT_VERSIONS)}"
+        )
+    
+    # Environment variable names follow the pattern:
+    # Signature: TypeParametersActivity{version} (the long base64 string)
+    # Activity alias: ACTIVITY_FULL_ALIAS_TypeParameters{version} (e.g., nickname.ActivityName+dev)
+    signature_env = f"TypeParametersActivity{revit_version}"
+    alias_env = f"ACTIVITY_FULL_ALIAS_TypeParameters{revit_version}"
+    
+    signature = os.getenv(signature_env, "")
+    activity_full_alias = os.getenv(alias_env, "")
+    
+    if not signature:
+        raise ValueError(f"Missing environment variable: {signature_env}")
+    if not activity_full_alias:
+        raise ValueError(f"Missing environment variable: {alias_env}")
+    
+    return signature, activity_full_alias
+
+
+# Keep old function name as alias for backwards compatibility
+def get_type_parameters_signature(revit_version: str | None) -> tuple[str, str]:
+    """Alias for get_type_parameters_config for backwards compatibility."""
+    if revit_version is None:
+        revit_version = DEFAULT_REVIT_VERSION
+    return get_type_parameters_config(revit_version)
 
 
 def get_viewables_from_urn(token:str, object_urn: str) -> list[dict[str, Any]]:
