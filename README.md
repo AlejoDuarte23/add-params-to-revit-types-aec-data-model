@@ -8,7 +8,7 @@ A VIKTOR app that automates adding custom parameters to Revit model types and ex
 
 Upload your Revit file, define custom parameters in a table, and automatically add them to specific element types and families.
 
-![Step 1 - Add Parameters](assets\thumbnail_add_params_add_dx.png)
+![Step 1 - Add Parameters](assets/thumbnail_add_params_add_dx.png)
 
 
 ## Prerequisites
@@ -43,6 +43,8 @@ In general, you will need to:
 1. Generate a secret key pair (private + public key) using the official [Das.WorkItemSigner](https://github.com/autodesk-platform-services/aps-designautomation-signer/releases)
 2. Upload the public key to your APS app
 
+Reference video: [Generate keys and upload public key (video)](https://drive.google.com/file/d/1tbn-RLlPIXTYE0rThsLPXZ0sBQDS03_u/view?usp=sharing)
+
 > **Note**: You can run this notebook outside the repo. If running inside this repo, use `uv` to install the `requirements.txt` and add that venv to the notebook. Alternatively, run `viktor-cli install` and activate the created venv (`source .venv/bin/activate` or `.\.venv\Scripts\Activate.ps1` on Windows).
 
 ### 4. Create Design Automation Activities
@@ -50,6 +52,8 @@ In general, you will need to:
 
 1. **Add Parameters to Type Activity**  
    Follow: `autodesk_automation - ChangeTypes/create_activities_by_revit_version.ipynb`
+
+Reference video: [Create Design Automation Activities (video)](https://drive.google.com/file/d/1JIVLPy8EwgqC2lCMnvBCjN650QrJ9zob/view?usp=drive_link)
 
 
 ### 5. Add Activity Full Aliases to .env
@@ -75,6 +79,8 @@ Run the signer tool for each activity:
 # ... repeat for all versions (2023-2026)
 ```
 
+Reference video: [Sign activities (video)](https://drive.google.com/file/d/18SBWyeNlMdbXxgN1HrPO85fvQRb8583m/view?usp=drive_link)
+
 ### 7. Add Activity Signatures to .env
 
 Add the generated signatures for each activity to your `.env` file:
@@ -84,6 +90,8 @@ TypeParametersActivity2023 = "<signature>"
 TypeParametersActivity2024 = "<signature>"
 # ... add all signatures
 ```
+
+Reference video: [Add activity signatures to `.env` (video)](https://drive.google.com/file/d/1EnVwBDOJYZWabi3Ihn8IiBWaG4nfJ1g4/view?usp=drive_link)
 
 ### 8. Set Up VIKTOR APS Integration
 
