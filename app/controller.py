@@ -1,29 +1,65 @@
 import base64
 import json
 import textwrap
+import time
+import uuid
+from collections import defaultdict
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 import viktor as vkt
+from aps_automation_sdk.acc import parent_folder_from_item
+from aps_automation_sdk.classes import (
+    ActivityInputParameterAcc,
+    ActivityJsonParameter,
+    ActivityOutputParameterAcc,
+    WorkItemAcc,
+)
+from dotenv import load_dotenv
+
+from app.helpers import (
+    DEFAULT_REVIT_VERSION,
+    fetch_manifest,
+    get_revit_version_from_manifest,
+    get_type_parameters_signature,
+)
 
 
 AEC_GRAPHQL_URL = "https://developer.api.autodesk.com/aec/graphql"
+DA_V3 = "https://developer.api.autodesk.com/da/us-east/v3"
 
 
 ELEMENTS_BY_TYPE_QUERY = """
 query ElementsByType($elementGroupId: ID!, $rsqlFilter: String!, $pagination: PaginationInput) {
-    elementsByElementGroup(
+        elementsByElementGroup(
+                elementGroupId: $elementGroupId
+                filter: { query: $rsqlFilter }
+                pagination: $pagination
+        ) {
+                pagination { cursor pageSize }
+                results {
+                        id
+                        name
+                        alternativeIdentifiers {
+                                externalElementId
+                        }
+                }
+        }
+}
+"""
+
+
+FAMILY_QUERY = """
+query DistinctFamilies($elementGroupId: ID!, $limit: Int!) {
+    distinctPropertyValuesInElementGroupByName(
         elementGroupId: $elementGroupId
-        filter: { query: $rsqlFilter }
-        pagination: $pagination
+        name: "Family Name"
+        filter: { query: "'property.name.Element Context'==Instance" }
     ) {
-        pagination { cursor pageSize }
         results {
-            id
-            name
-            alternativeIdentifiers {
-                externalElementId
+            values(limit: $limit) {
+                value
             }
         }
     }
@@ -31,8 +67,73 @@ query ElementsByType($elementGroupId: ID!, $rsqlFilter: String!, $pagination: Pa
 """
 
 
-def execute_graphql(query: str, token: str, region: str, variables: Optional[dict] = None, timeout: int = 30) -> dict:
-    """Execute a GraphQL query against the Autodesk AEC Data Model endpoint."""
+ELEMENT_NAMES_BY_FAMILY_QUERY = """
+query ElementNamesByFamily($elementGroupId: ID!, $rsqlFilter: String!) {
+    distinctPropertyValuesInElementGroupByName(
+        elementGroupId: $elementGroupId
+        name: "Element Name"
+        filter: { query: $rsqlFilter }
+    ) {
+        results {
+            values(limit: 500) {
+                value
+            }
+        }
+    }
+}
+"""
+
+
+load_dotenv()
+
+
+def bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def get_workitem_status(wi_id: str, token: str) -> Dict[str, Any]:
+    url = f"{DA_V3}/workitems/{wi_id}"
+    resp = requests.get(url, headers=bearer(token), timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def create_type_params_json(params) -> List[Dict[str, Any]]:
+    """Group assignments by parameter + group into DA config payload."""
+
+    rows = getattr(getattr(params, "assignments_section", None), "assignments", None) or []
+    grouped: Dict[tuple, List[Dict[str, Any]]] = defaultdict(list)
+
+    for row in rows:
+        param_name = row.get("parameter")
+        if not param_name:
+            continue
+        param_group = row.get("parameter_group") or "PG_DATA"
+        target = {
+            "TypeName": row.get("type_name") or "",
+            "FamilyName": row.get("family") or "",
+            "Value": row.get("parameter_value") or "",
+        }
+        grouped[(param_name, param_group)].append(target)
+
+    payload: List[Dict[str, Any]] = []
+    for (name, group), targets in grouped.items():
+        if not name:
+            continue
+        if not targets:
+            continue
+        payload.append(
+            {
+                "ParameterName": name,
+                "ParameterGroup": group,
+                "Targets": targets,
+            }
+        )
+
+    return payload
+
+def execute_graphql(query: str, *, token: str, region: str, variables: Optional[dict] = None, timeout: int = 30) -> dict:
+    """Execute a GraphQL query against the AEC Data Model API."""
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -52,36 +153,58 @@ def execute_graphql(query: str, token: str, region: str, variables: Optional[dic
     return body.get("data", {})
 
 
-def fetch_elements_by_type(
-    *,
-    element_group_id: str,
-    token: str,
-    region: str,
-    family_name: Optional[str],
-    element_name: str,
-    page_limit: int = 200,
-) -> List[dict]:
-    """Return all instance elements that match the given family and element (type) name.
+def _escape_rsql_value(value: str) -> str:
+    """Escape single quotes in RSQL string values."""
 
-    Filters on Element Context == Instance, Element Name, and optionally Family Name.
-    Returns a list of dicts containing id, name, and alternativeIdentifiers.externalElementId.
-    """
+    return value.replace("'", "\\'")
 
-    family_safe = family_name.replace("'", "\\'") if family_name else None
-    element_safe = element_name.replace("'", "\\'")
 
+def fetch_families(*, element_group_id: str, token: str, region: str, limit: int = 500) -> List[str]:
+    variables = {"elementGroupId": element_group_id, "limit": limit}
+    data = execute_graphql(FAMILY_QUERY, token=token, region=region, variables=variables)
+    results = (data.get("distinctPropertyValuesInElementGroupByName") or {}).get("results") or []
+
+    families: List[str] = []
+    for block in results:
+        for entry in block.get("values") or []:
+            value = entry.get("value")
+            if value:
+                families.append(str(value))
+    return sorted(set(families))
+
+
+def fetch_element_names_for_family(
+    *, element_group_id: str, token: str, region: str, family_name: str, limit: int = 500
+) -> List[str]:
+    family_val = _escape_rsql_value(family_name)
+    rsql_filter = f"'property.name.Family Name'=='{family_val}' and 'property.name.Element Context'==Instance"
+    variables = {"elementGroupId": element_group_id, "rsqlFilter": rsql_filter}
+    data = execute_graphql(ELEMENT_NAMES_BY_FAMILY_QUERY, token=token, region=region, variables=variables)
+    results = (data.get("distinctPropertyValuesInElementGroupByName") or {}).get("results") or []
+
+    element_names: List[str] = []
+    for block in results:
+        for entry in block.get("values") or []:
+            value = entry.get("value")
+            if value:
+                element_names.append(str(value))
+    return sorted(set(element_names))
+
+
+def fetch_elements_for_type(
+    *, element_group_id: str, token: str, region: str, family_name: Optional[str], type_name: str, page_limit: int = 200
+) -> List[str]:
     rsql_parts = ["'property.name.Element Context'==Instance"]
-    if family_safe:
-        rsql_parts.append(f"'property.name.Family Name'=='{family_safe}'")
-    rsql_parts.append(f"'property.name.Element Name'=='{element_safe}'")
+    if family_name:
+        rsql_parts.append(f"'property.name.Family Name'=='{_escape_rsql_value(family_name)}'")
+    rsql_parts.append(f"'property.name.Element Name'=='{_escape_rsql_value(type_name)}'")
     rsql_filter = " and ".join(rsql_parts)
 
-    results: List[dict] = []
+    external_ids: List[str] = []
     cursor: Optional[str] = None
     page = 1
 
     while True:
-        vkt.progress_message(message=f"Fetching instances for '{element_name}' (page {page})")
         variables = {
             "elementGroupId": element_group_id,
             "rsqlFilter": rsql_filter,
@@ -89,123 +212,95 @@ def fetch_elements_by_type(
         }
         data = execute_graphql(ELEMENTS_BY_TYPE_QUERY, token=token, region=region, variables=variables)
         block = data.get("elementsByElementGroup") or {}
-        page_results = block.get("results") or []
-        results.extend(page_results)
+        results = block.get("results") or []
+
+        for element in results:
+            alt_ids = element.get("alternativeIdentifiers") or {}
+            ext_id = alt_ids.get("externalElementId")
+            if ext_id:
+                external_ids.append(str(ext_id))
 
         pagination = block.get("pagination") or {}
         new_cursor = pagination.get("cursor")
-        if not new_cursor or new_cursor == cursor or len(page_results) == 0:
+        if not new_cursor or new_cursor == cursor or not results:
             break
+
         cursor = new_cursor
         page += 1
+        vkt.progress_message(message=f"Fetching elements for type page {page}")
 
-    return results
+    return external_ids
 
 
 def get_model_info(params, **kwargs) -> Optional[dict]:
-    """Return token, region, element group id, and file if an Autodesk file is selected."""
+    """Return token, region, element group id, viewer URN, and file if an Autodesk file is selected."""
 
     autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
     if not autodesk_file:
         return None
 
-    integration = vkt.external.OAuth2Integration("aps-integration-design")
+    integration = vkt.external.OAuth2Integration("aps-integration-automation-v2")
     token = integration.get_access_token()
     region = autodesk_file.get_region(token)
-    element_group_id = autodesk_file.get_aec_data_model_element_group_id(token)
+    version = autodesk_file.get_latest_version(token)
+    viewer_urn_bs64 = _encode_urn(version.urn)
+
+    project_id = getattr(autodesk_file, "project_id", None)
+    if not project_id:
+        raise vkt.UserError("Project id is missing on the selected Autodesk file.")
+
+    file_urn = getattr(autodesk_file, "urn", None)
+    if not file_urn:
+        raise vkt.UserError("URN is missing on the selected Autodesk file.")
 
     model_name = getattr(autodesk_file, "name", None) or "selected model"
     vkt.UserMessage.info(
         f"Fetching Autodesk model info for {model_name} (region: {region})."
     )
 
+    element_group_id = autodesk_file.get_aec_data_model_element_group_id(token)
+
     return {
         "token": token,
         "region": region,
         "element_group_id": element_group_id,
+        "urn_bs64": viewer_urn_bs64,
         "file": autodesk_file,
     }
 
 
-FAMILY_QUERY = """
-query DistinctFamilies($elementGroupId: ID!, $limit: Int!) {
-  distinctPropertyValuesInElementGroupByName(
-    elementGroupId: $elementGroupId
-    name: "Family Name"
-    filter: { query: "'property.name.Element Context'==Instance" }
-  ) {
-    results {
-      values(limit: $limit) {
-        value
-      }
-    }
-  }
-}
-"""
-
-
-ELEMENT_NAMES_BY_FAMILY_QUERY = """
-query ElementNamesByFamily($elementGroupId: ID!, $rsqlFilter: String!) {
-  distinctPropertyValuesInElementGroupByName(
-    elementGroupId: $elementGroupId
-    name: "Element Name"
-    filter: { query: $rsqlFilter }
-  ) {
-    results {
-      values(limit: 500) {
-        value
-      }
-    }
-  }
-}
-"""
-
-
-def _extract_distinct_values(data: dict) -> List[str]:
-    block = data.get("distinctPropertyValuesInElementGroupByName") or {}
-    values = []
-    for result in block.get("results") or []:
-        for item in result.get("values") or []:
-            value = item.get("value")
-            if value:
-                values.append(value)
-    return values
-
-
 @vkt.memoize
 def get_family_list(*, element_group_id: str, token: str, region: str) -> List[str]:
-    """Return sorted distinct family names (fetched once per model)."""
+    """Return sorted distinct family names from the AEC Data Model."""
 
-    data = execute_graphql(
-        FAMILY_QUERY,
-        token=token,
-        region=region,
-        variables={"elementGroupId": element_group_id, "limit": 500},
-    )
-    return sorted(set(_extract_distinct_values(data)))
+    return fetch_families(element_group_id=element_group_id, token=token, region=region)
 
 
 @vkt.memoize
 def get_types_for_family(*, element_group_id: str, token: str, region: str, family_name: str) -> List[str]:
-    """Return sorted distinct element names for a given family (lazy per family)."""
+    """Return sorted distinct element names for a given family from the AEC Data Model."""
 
-    rsql_filter = " and ".join(
-        [
-            "'property.name.Element Context'==Instance",
-            f"'property.name.Family Name'=='{family_name}'",
-        ]
-    )
-
-    family_data = execute_graphql(
-        ELEMENT_NAMES_BY_FAMILY_QUERY,
+    return fetch_element_names_for_family(
+        element_group_id=element_group_id,
         token=token,
         region=region,
-        variables={
-            "elementGroupId": element_group_id,
-            "rsqlFilter": rsql_filter,
-        },
+        family_name=family_name,
     )
-    return sorted(set(_extract_distinct_values(family_data)))
+
+
+@vkt.memoize
+def get_external_ids_for_type(
+    *, element_group_id: str, token: str, region: str, family_name: Optional[str], type_name: str
+) -> List[str]:
+    """Return external element ids for a given family/type pair."""
+
+    return fetch_elements_for_type(
+        element_group_id=element_group_id,
+        token=token,
+        region=region,
+        family_name=family_name,
+        type_name=type_name,
+    )
 
 
 def get_family_options(params, **kwargs):
@@ -270,7 +365,7 @@ class Parametrization(vkt.Parametrization):
     )
     model.autodesk_file = vkt.AutodeskFileField(
         "Revit model",
-        oauth2_integration="aps-integration-design",
+        oauth2_integration="aps-integration-automation-v2",
     )
 
     parameter_section = vkt.Section("Parameter Table")
@@ -305,16 +400,37 @@ class Parametrization(vkt.Parametrization):
     assignments_section.assignments.parameter = vkt.OptionField(
         "Parameter Name", options=get_parameter_options, autoselect_single_option=True
     )
+    assignments_section.assignments.parameter_group = vkt.OptionField(
+        "Parameter Group",
+        options=["PG_TEXT", "PG_DATA", "PG_IDENTITY_DATA", "PG_GEOMETRY"],
+        autoselect_single_option=True,
+    )
     assignments_section.assignments.parameter_value = vkt.TextField("Parameter Value")
     assignments_section.assignments.color = vkt.ColorField(
         "Color", default=vkt.Color(0, 153, 255)
     )
 
+    run_automation = vkt.Section("Run Automation")
+    run_automation.title = vkt.Text(
+        textwrap.dedent(
+            """\
+            ## Run Automation
+            Select a model and trigger the automation workflow (coming soon).
+            """
+        )
+    )
+    run_automation.autodesk_file = vkt.AutodeskFileField(
+        "Revit model",
+        oauth2_integration="aps-integration-automation-v2",
+    )
+    run_automation.break_line = vkt.LineBreak()
+    run_automation.trigger = vkt.ActionButton("Run Automation", method="trigger_run_automation")
+
 
 def _encode_urn(raw_urn: str) -> str:
-    """Return urlsafe base64 encoding without padding for Forge URNs."""
+    """Return urlsafe base64 encoding (keep padding) for Forge URNs."""
 
-    return base64.urlsafe_b64encode(raw_urn.encode()).decode().rstrip("=")
+    return base64.urlsafe_b64encode(raw_urn.encode()).decode()
 
 
 def _color_to_hex(color: Optional[vkt.Color]) -> str:
@@ -338,8 +454,7 @@ class Controller(vkt.Controller):
             f"Launching viewer with {len(params_rows)} parameter rows and {len(assignments)} assignment rows."
         )
 
-        version = info["file"].get_latest_version(info["token"])
-        urn_bs64 = _encode_urn(version.urn)
+        urn_bs64 = info.get("urn_bs64")
 
         visible_params = {
             row.get("parameter_name")
@@ -348,6 +463,7 @@ class Controller(vkt.Controller):
         }
 
         external_id_color_map = {}
+        ext_ids_cache: Dict[tuple, List[str]] = {}
         for row in assignments:
             type_name = row.get("type_name")
             if not type_name:
@@ -358,22 +474,26 @@ class Controller(vkt.Controller):
             family_name = row.get("family")
             color_hex = _color_to_hex(row.get("color"))
 
-            try:
-                elements = fetch_elements_by_type(
-                    element_group_id=info["element_group_id"],
-                    token=info["token"],
-                    region=info["region"],
-                    family_name=family_name,
-                    element_name=type_name,
-                )
-            except Exception as exc:
-                vkt.UserMessage.warning(f"Failed to fetch instances for {type_name}: {exc}")
+            cache_key = (family_name or "", type_name)
+            if cache_key not in ext_ids_cache:
+                try:
+                    ext_ids_cache[cache_key] = get_external_ids_for_type(
+                        element_group_id=info["element_group_id"],
+                        token=info["token"],
+                        region=info["region"],
+                        family_name=family_name,
+                        type_name=type_name,
+                    )
+                except Exception:
+                    ext_ids_cache[cache_key] = []
+
+            matched_external_ids = ext_ids_cache.get(cache_key) or []
+            if not matched_external_ids:
+                vkt.UserMessage.warning(f"No instances found for type '{type_name}'.")
                 continue
 
-            for element in elements:
-                alt = (element.get("alternativeIdentifiers") or {}).get("externalElementId")
-                if alt:
-                    external_id_color_map[alt] = color_hex
+            for ext_id in matched_external_ids:
+                external_id_color_map[ext_id] = color_hex
 
         external_ids = [{ext_id: color} for ext_id, color in external_id_color_map.items()]
 
@@ -384,3 +504,131 @@ class Controller(vkt.Controller):
         html = html.replace("EXTERNAL_IDS_PLACEHOLDER", json.dumps(external_ids))
 
         return vkt.WebResult(html=html)
+
+    def trigger_run_automation(self, params, **kwargs):
+        """Run DA to add parameters to Revit types via ACC."""
+
+        integration = vkt.external.OAuth2Integration("aps-integration-automation-v2")
+        token = integration.get_access_token()
+
+        autodesk_file = getattr(getattr(params, "run_automation", None), "autodesk_file", None)
+        if not autodesk_file:
+            raise vkt.UserError("Select a model in the Run Automation section first")
+
+        project_id = getattr(autodesk_file, "project_id", None)
+        file_urn = getattr(autodesk_file, "urn", None)
+        if not project_id or not file_urn:
+            raise vkt.UserError("Missing project id or URN for the selected Autodesk file.")
+
+        vkt.UserMessage.info("Starting Design Automation workflow...")
+        vkt.progress_message("Preparing files...", percentage=5)
+
+        version = autodesk_file.get_latest_version(token)
+        attrs = getattr(version, "attributes", {}) or {}
+        display_name = attrs.get("displayName", "model")
+
+        try:
+            manifest = fetch_manifest(autodesk_file, token)
+            revit_version = get_revit_version_from_manifest(manifest) or DEFAULT_REVIT_VERSION
+            vkt.UserMessage.info(f"Detected Revit version: {revit_version}")
+        except Exception as exc:  # noqa: BLE001
+            revit_version = DEFAULT_REVIT_VERSION
+            vkt.UserMessage.info(f"Could not detect Revit version ({exc}); using default {revit_version}")
+
+        signature, activity_full_alias = get_type_parameters_signature(revit_version)
+
+        input_revit = ActivityInputParameterAcc(
+            name="rvtFile",
+            localName="input.rvt",
+            verb="get",
+            description="Input Revit File",
+            required=True,
+            is_engine_input=True,
+            project_id=project_id,
+            linage_urn=file_urn,
+        )
+
+        folder_id = parent_folder_from_item(
+            project_id=project_id,
+            item_id=file_urn,
+            token=token,
+        )
+
+        type_params_config = create_type_params_json(params)
+        if not type_params_config:
+            raise vkt.UserError("Add at least one assignment with a parameter to run automation.")
+
+        input_json = ActivityJsonParameter(
+            name="configJson",
+            file_name="revit_type_params.json",
+            localName="revit_type_params.json",
+            verb="get",
+            description="Type parameter JSON configuration",
+        )
+        input_json.set_content(type_params_config)
+
+        short_uuid = uuid.uuid4().hex[:8]
+        output_filename = f"{display_name}_{short_uuid}.rvt"
+        output_file = ActivityOutputParameterAcc(
+            name="result",
+            localName="output.rvt",
+            verb="put",
+            description="Result Revit model with added parameters",
+            folder_id=folder_id,
+            project_id=project_id,
+            file_name=output_filename,
+        )
+
+        workitem = WorkItemAcc(
+            parameters=[input_revit, input_json, output_file],
+            activity_full_alias=activity_full_alias,
+        )
+
+        vkt.UserMessage.info("Creating work item...")
+        vkt.progress_message("Running Design Automation...", percentage=35)
+        workitem_id = workitem.run_public_activity(
+            token3lo=token,
+            activity_signature=signature,
+        )
+        vkt.UserMessage.info(f"Workitem ID: {workitem_id}")
+
+        elapsed = 0
+        poll_interval = 10
+        max_wait = 600
+        final_status = None
+        report_url = None
+
+        while elapsed <= max_wait:
+            status_payload = get_workitem_status(workitem_id, token)
+            final_status = status_payload.get("status")
+            report_url = status_payload.get("reportUrl")
+            pct = min(35 + int((elapsed / max_wait) * 55), 90)
+            vkt.progress_message(f"Work item status: {final_status} [{elapsed}s] {report_url=}...", percentage=pct)
+            print(report_url)
+            if final_status in ("success", "failed", "cancelled"):
+                if final_status in ("failed", "cancelled") and report_url:
+                    print(f"Work item {final_status}. Report URL: {report_url}")
+                break
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        if final_status != "success":
+            msg = f"Automation did not finish with success. Status: {final_status}"
+            if report_url:
+                msg += f"\nReport URL: {report_url}"
+            raise vkt.UserError(msg)
+
+        output_file.create_acc_item(token=token)
+        vkt.progress_message("Updated model ready for viewing!", percentage=100)
+
+        total_targets = sum(len(entry.get("Targets", [])) for entry in type_params_config)
+        success_msg = (
+            "Automation completed successfully!\n\n"
+            f"Parameters configured: {len(type_params_config)}\n"
+            f"Total targets: {total_targets}\n"
+            f"Workitem ID: {workitem_id}"
+        )
+        if report_url:
+            success_msg += f"\nReport URL: {report_url}"
+
+        vkt.UserMessage.success(success_msg)
