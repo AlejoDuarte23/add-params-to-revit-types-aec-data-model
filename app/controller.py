@@ -26,39 +26,57 @@ from app.helpers import (
 )
 
 
-DX_GRAPHQL_URL = "https://developer.api.autodesk.com/dataexchange/2023-05/graphql"
+AEC_GRAPHQL_URL = "https://developer.api.autodesk.com/aec/graphql"
 DA_V3 = "https://developer.api.autodesk.com/da/us-east/v3"
 
 
-EXCHANGE_BY_FILE_URN_QUERY = """
-query GetExchangeByFileUrn($externalProjectId: ID!, $fileUrn: ID!) {
-    exchangeByFileUrn(externalProjectId: $externalProjectId, fileUrn: $fileUrn) {
-        id
-        name
+ELEMENTS_BY_TYPE_QUERY = """
+query ElementsByType($elementGroupId: ID!, $rsqlFilter: String!, $pagination: PaginationInput) {
+        elementsByElementGroup(
+                elementGroupId: $elementGroupId
+                filter: { query: $rsqlFilter }
+                pagination: $pagination
+        ) {
+                pagination { cursor pageSize }
+                results {
+                        id
+                        name
+                        alternativeIdentifiers {
+                                externalElementId
+                        }
+                }
+        }
+}
+"""
+
+
+FAMILY_QUERY = """
+query DistinctFamilies($elementGroupId: ID!, $limit: Int!) {
+    distinctPropertyValuesInElementGroupByName(
+        elementGroupId: $elementGroupId
+        name: "Family Name"
+        filter: { query: "'property.name.Element Context'==Instance" }
+    ) {
+        results {
+            values(limit: $limit) {
+                value
+            }
+        }
     }
 }
 """
 
 
-ELEMENTS_WITH_PROPS_QUERY = """
-query ElementsWithProps($exchangeId: ID!, $pagination: PaginationInput) {
-    exchange(exchangeId: $exchangeId) {
-        elements(pagination: $pagination) {
-            pagination {
-                cursor
-                pageSize
-            }
-            results {
-                id
-                properties(filter: { names: ["Family Name", "Element Name"] }) {
-                    results {
-                        name
-                        value
-                    }
-                }
-                alternativeIdentifiers {
-                    externalElementId
-                }
+ELEMENT_NAMES_BY_FAMILY_QUERY = """
+query ElementNamesByFamily($elementGroupId: ID!, $rsqlFilter: String!) {
+    distinctPropertyValuesInElementGroupByName(
+        elementGroupId: $elementGroupId
+        name: "Element Name"
+        filter: { query: $rsqlFilter }
+    ) {
+        results {
+            values(limit: 500) {
+                value
             }
         }
     }
@@ -115,15 +133,15 @@ def create_type_params_json(params) -> List[Dict[str, Any]]:
     return payload
 
 def execute_graphql(query: str, *, token: str, region: str, variables: Optional[dict] = None, timeout: int = 30) -> dict:
-    """Execute a GraphQL query against the Data Exchange API."""
+    """Execute a GraphQL query against the AEC Data Model API."""
 
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
-        "x-ads-region": region,
+        "Region": region,
     }
     payload = {"query": query, "variables": variables or {}}
-    response = requests.post(DX_GRAPHQL_URL, headers=headers, json=payload, timeout=timeout)
+    response = requests.post(AEC_GRAPHQL_URL, headers=headers, json=payload, timeout=timeout)
 
     if response.status_code != 200:
         raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
@@ -135,96 +153,87 @@ def execute_graphql(query: str, *, token: str, region: str, variables: Optional[
     return body.get("data", {})
 
 
-def extract_props(prop_results: Optional[dict]) -> Dict[str, Optional[str]]:
-    """Convert GraphQL property results into a flat dict of name -> value."""
+def _escape_rsql_value(value: str) -> str:
+    """Escape single quotes in RSQL string values."""
 
-    properties = {}
-    for prop in (prop_results or {}).get("results") or []:
-        name = prop.get("name")
-        value = prop.get("value")
-        if name:
-            properties[name] = value if value is None else str(value)
-    return properties
+    return value.replace("'", "\\'")
 
 
-ELEMENT_CACHE: Dict[str, List[dict]] = {}
+def fetch_families(*, element_group_id: str, token: str, region: str, limit: int = 500) -> List[str]:
+    variables = {"elementGroupId": element_group_id, "limit": limit}
+    data = execute_graphql(FAMILY_QUERY, token=token, region=region, variables=variables)
+    results = (data.get("distinctPropertyValuesInElementGroupByName") or {}).get("results") or []
+
+    families: List[str] = []
+    for block in results:
+        for entry in block.get("values") or []:
+            value = entry.get("value")
+            if value:
+                families.append(str(value))
+    return sorted(set(families))
 
 
-def fetch_elements_catalog(*, exchange_id: str, token: str, region: str, page_size: int = 200) -> List[dict]:
-    """Fetch all elements once, capturing family, type, and external IDs."""
+def fetch_element_names_for_family(
+    *, element_group_id: str, token: str, region: str, family_name: str, limit: int = 500
+) -> List[str]:
+    family_val = _escape_rsql_value(family_name)
+    rsql_filter = f"'property.name.Family Name'=='{family_val}' and 'property.name.Element Context'==Instance"
+    variables = {"elementGroupId": element_group_id, "rsqlFilter": rsql_filter}
+    data = execute_graphql(ELEMENT_NAMES_BY_FAMILY_QUERY, token=token, region=region, variables=variables)
+    results = (data.get("distinctPropertyValuesInElementGroupByName") or {}).get("results") or []
 
-    catalog: List[dict] = []
+    element_names: List[str] = []
+    for block in results:
+        for entry in block.get("values") or []:
+            value = entry.get("value")
+            if value:
+                element_names.append(str(value))
+    return sorted(set(element_names))
+
+
+def fetch_elements_for_type(
+    *, element_group_id: str, token: str, region: str, family_name: Optional[str], type_name: str, page_limit: int = 200
+) -> List[str]:
+    rsql_parts = ["'property.name.Element Context'==Instance"]
+    if family_name:
+        rsql_parts.append(f"'property.name.Family Name'=='{_escape_rsql_value(family_name)}'")
+    rsql_parts.append(f"'property.name.Element Name'=='{_escape_rsql_value(type_name)}'")
+    rsql_filter = " and ".join(rsql_parts)
+
+    external_ids: List[str] = []
     cursor: Optional[str] = None
     page = 1
 
     while True:
-        vkt.progress_message(message=f"Fetching elements (page {page})")
         variables = {
-            "exchangeId": exchange_id,
-            "pagination": {"limit": page_size, "cursor": cursor},
+            "elementGroupId": element_group_id,
+            "rsqlFilter": rsql_filter,
+            "pagination": {"limit": page_limit} if not cursor else {"cursor": cursor, "limit": page_limit},
         }
-        data = execute_graphql(ELEMENTS_WITH_PROPS_QUERY, token=token, region=region, variables=variables)
-        exchange_block = data.get("exchange") or {}
-        elements_block = exchange_block.get("elements") or {}
-        results = elements_block.get("results") or []
+        data = execute_graphql(ELEMENTS_BY_TYPE_QUERY, token=token, region=region, variables=variables)
+        block = data.get("elementsByElementGroup") or {}
+        results = block.get("results") or []
 
         for element in results:
-            props = extract_props(element.get("properties"))
-            family_name = props.get("Family Name")
-            element_name = props.get("Element Name")
-
             alt_ids = element.get("alternativeIdentifiers") or {}
             ext_id = alt_ids.get("externalElementId")
             if ext_id:
-                ext_id = str(ext_id)
-                print(f"externalElementId found: {ext_id}")
+                external_ids.append(str(ext_id))
 
-            catalog.append(
-                {
-                    "family_name": family_name,
-                    "element_name": element_name,
-                    "external_id": ext_id,
-                }
-            )
-
-        pagination = elements_block.get("pagination") or {}
-        cursor = pagination.get("cursor")
-        if not cursor:
+        pagination = block.get("pagination") or {}
+        new_cursor = pagination.get("cursor")
+        if not new_cursor or new_cursor == cursor or not results:
             break
 
+        cursor = new_cursor
         page += 1
-        print(f"Processing Page: {page}")
-        vkt.progress_message(message=f'Processing page:{page}')
+        vkt.progress_message(message=f"Fetching elements for type page {page}")
 
-    return catalog
-
-
-@vkt.memoize
-def get_elements_catalog(*, exchange_id: str, token: str, region: str) -> List[dict]:
-    """Return cached catalog of elements for the exchange id."""
-
-    if exchange_id in ELEMENT_CACHE:
-        return ELEMENT_CACHE[exchange_id]
-
-    catalog = fetch_elements_catalog(exchange_id=exchange_id, token=token, region=region)
-    ELEMENT_CACHE[exchange_id] = catalog
-    return catalog
-
-
-def fetch_exchange_id(*, project_id: str, file_urn: str, token: str, region: str) -> str:
-    """Resolve exchange id via exchangeByFileUrn."""
-
-    variables = {"externalProjectId": project_id, "fileUrn": file_urn}
-    data = execute_graphql(EXCHANGE_BY_FILE_URN_QUERY, token=token, region=region, variables=variables)
-    exchange = (data or {}).get("exchangeByFileUrn") or {}
-    exch_id = exchange.get("id")
-    if not exch_id:
-        raise vkt.UserError("No exchange id found for the selected file/project.")
-    return exch_id
+    return external_ids
 
 
 def get_model_info(params, **kwargs) -> Optional[dict]:
-    """Return token, region, exchange id, viewer URN, and file if an Autodesk file is selected."""
+    """Return token, region, element group id, viewer URN, and file if an Autodesk file is selected."""
 
     autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
     if not autodesk_file:
@@ -244,42 +253,54 @@ def get_model_info(params, **kwargs) -> Optional[dict]:
     if not file_urn:
         raise vkt.UserError("URN is missing on the selected Autodesk file.")
 
-    exchange_id = fetch_exchange_id(project_id=project_id, file_urn=file_urn, token=token, region=region)
-
     model_name = getattr(autodesk_file, "name", None) or "selected model"
     vkt.UserMessage.info(
         f"Fetching Autodesk model info for {model_name} (region: {region})."
     )
 
+    element_group_id = autodesk_file.get_aec_data_model_element_group_id(token)
+
     return {
         "token": token,
         "region": region,
-        "exchange_id": exchange_id,
+        "element_group_id": element_group_id,
         "urn_bs64": viewer_urn_bs64,
         "file": autodesk_file,
     }
 
 
 @vkt.memoize
-def get_family_list(*, exchange_id: str, token: str, region: str) -> List[str]:
-    """Return sorted distinct family names from the cached catalog."""
+def get_family_list(*, element_group_id: str, token: str, region: str) -> List[str]:
+    """Return sorted distinct family names from the AEC Data Model."""
 
-    catalog = get_elements_catalog(exchange_id=exchange_id, token=token, region=region)
-    families = {row.get("family_name") for row in catalog if row.get("family_name")}
-    return sorted(families)
+    return fetch_families(element_group_id=element_group_id, token=token, region=region)
 
 
 @vkt.memoize
-def get_types_for_family(*, exchange_id: str, token: str, region: str, family_name: str) -> List[str]:
-    """Return sorted distinct element names for a given family from the cached catalog."""
+def get_types_for_family(*, element_group_id: str, token: str, region: str, family_name: str) -> List[str]:
+    """Return sorted distinct element names for a given family from the AEC Data Model."""
 
-    catalog = get_elements_catalog(exchange_id=exchange_id, token=token, region=region)
-    types = {
-        row.get("element_name")
-        for row in catalog
-        if row.get("element_name") and row.get("family_name") == family_name
-    }
-    return sorted(types)
+    return fetch_element_names_for_family(
+        element_group_id=element_group_id,
+        token=token,
+        region=region,
+        family_name=family_name,
+    )
+
+
+@vkt.memoize
+def get_external_ids_for_type(
+    *, element_group_id: str, token: str, region: str, family_name: Optional[str], type_name: str
+) -> List[str]:
+    """Return external element ids for a given family/type pair."""
+
+    return fetch_elements_for_type(
+        element_group_id=element_group_id,
+        token=token,
+        region=region,
+        family_name=family_name,
+        type_name=type_name,
+    )
 
 
 def get_family_options(params, **kwargs):
@@ -289,7 +310,7 @@ def get_family_options(params, **kwargs):
 
     try:
         return get_family_list(
-            exchange_id=info["exchange_id"],
+            element_group_id=info["element_group_id"],
             token=info["token"],
             region=info["region"],
         )
@@ -314,7 +335,7 @@ def get_type_options(params, **kwargs):
             continue
         try:
             types = get_types_for_family(
-                exchange_id=info["exchange_id"],
+                element_group_id=info["element_group_id"],
                 token=info["token"],
                 region=info["region"],
                 family_name=family,
@@ -433,12 +454,7 @@ class Controller(vkt.Controller):
             f"Launching viewer with {len(params_rows)} parameter rows and {len(assignments)} assignment rows."
         )
 
-        urn_bs64 = info.get("urn_bs64") or info.get("exchange_id")
-        catalog = get_elements_catalog(
-            exchange_id=info["exchange_id"],
-            token=info["token"],
-            region=info["region"],
-        )
+        urn_bs64 = info.get("urn_bs64")
 
         visible_params = {
             row.get("parameter_name")
@@ -447,6 +463,7 @@ class Controller(vkt.Controller):
         }
 
         external_id_color_map = {}
+        ext_ids_cache: Dict[tuple, List[str]] = {}
         for row in assignments:
             type_name = row.get("type_name")
             if not type_name:
@@ -457,21 +474,26 @@ class Controller(vkt.Controller):
             family_name = row.get("family")
             color_hex = _color_to_hex(row.get("color"))
 
-            matched_elements = [
-                element
-                for element in catalog
-                if element.get("element_name") == type_name
-                and (not family_name or element.get("family_name") == family_name)
-            ]
+            cache_key = (family_name or "", type_name)
+            if cache_key not in ext_ids_cache:
+                try:
+                    ext_ids_cache[cache_key] = get_external_ids_for_type(
+                        element_group_id=info["element_group_id"],
+                        token=info["token"],
+                        region=info["region"],
+                        family_name=family_name,
+                        type_name=type_name,
+                    )
+                except Exception:
+                    ext_ids_cache[cache_key] = []
 
-            if not matched_elements:
+            matched_external_ids = ext_ids_cache.get(cache_key) or []
+            if not matched_external_ids:
                 vkt.UserMessage.warning(f"No instances found for type '{type_name}'.")
                 continue
 
-            for element in matched_elements:
-                alt = element.get("external_id")
-                if alt:
-                    external_id_color_map[alt] = color_hex
+            for ext_id in matched_external_ids:
+                external_id_color_map[ext_id] = color_hex
 
         external_ids = [{ext_id: color} for ext_id, color in external_id_color_map.items()]
 
