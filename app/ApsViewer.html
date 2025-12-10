@@ -3,372 +3,272 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>APS Viewer, filter with default and per element colors</title>
+  <title>APS Viewer with View Selector</title>
   <link rel="stylesheet" href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.min.css" type="text/css">
   <script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
   <style>
     html, body, #apsViewerDiv { width: 100%; height: 100%; margin: 0; }
+    #viewSelector {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 100;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 8px 12px;
+      border-radius: 6px;
+      font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+      border: 1px solid #e0e0e0;
+    }
+    #viewSelector label {
+      color: #1a73e8;
+      margin-right: 8px;
+      font-weight: 600;
+    }
+    #viewDropdown {
+      padding: 6px 10px;
+      border: 1px solid #d0d0d0;
+      border-radius: 4px;
+      background: #fff;
+      color: #333;
+      font-size: 13px;
+      min-width: 200px;
+      cursor: pointer;
+    }
+    #viewDropdown:hover { border-color: #1a73e8; }
+    #viewDropdown:focus {
+      outline: none;
+      border-color: #1a73e8;
+      box-shadow: 0 0 0 2px rgba(26, 115, 232, 0.2);
+    }
   </style>
 </head>
 <body>
   <div id="apsViewerDiv"></div>
+  <div id="viewSelector">
+    <label for="viewDropdown">View:</label>
+    <select id="viewDropdown">
+      <option value="">Loading views...</option>
+    </select>
+  </div>
 
   <script>
-  // Injected external IDs from backend
+  // Injected configuration from backend
   var EXTERNAL_IDS = EXTERNAL_IDS_PLACEHOLDER;
-  // Replace these three in your backend
   var ACCESS_TOKEN = 'APS_TOKEN_PLACEHOLDER';
   var DOCUMENT_URN = 'urn:URN_PLACEHOLDER';
-  // Filtering by external IDs only; FILTER_ELEMENT is no longer used
-  console.log(EXTERNAL_IDS);
+  var VIEWABLES = VIEWABLES_PLACEHOLDER;
 
-  // You can inject these from your backend, or pass them via query string:
-  // ?token=...&urn=urn:...&filter=Walls&external=[{"extId1":"red"},{"extId2":"#00ff00"}]
+  // Color parsing, supports #rrggbb, 0xrrggbb, rgb(), rgba(); hex is what the backend sends
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
-    // Debug flags
-    const DEBUG_FILTER = true;
-    const DEBUG_FILTER_VERBOSE = true;
+  function colorStringToVec4(str, alphaDefault, THREE_REF) {
+    let a = typeof alphaDefault === 'number' ? alphaDefault : 0.85;
+    if (!str) return new THREE_REF.Vector4(0, 1, 0, a); // default green
 
-    function flog() {
-      if (!DEBUG_FILTER) return;
-      const args = Array.prototype.slice.call(arguments);
-      args.unshift('[Filter]');
-      console.log.apply(console, args);
+    let s = String(str).trim().toLowerCase();
+
+    // rgba(r,g,b,a)
+    let m = s.match(/^rgba?\s*\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})(?:\s*,\s*([0-9]*\.?[0-9]+))?\s*\)$/i);
+    if (m) {
+      const r = clamp01(parseInt(m[1], 10) / 255);
+      const g = clamp01(parseInt(m[2], 10) / 255);
+      const b = clamp01(parseInt(m[3], 10) / 255);
+      a = m[4] != null ? clamp01(parseFloat(m[4])) : a;
+      return new THREE_REF.Vector4(r, g, b, a);
     }
 
-    // Simple helpers
-    function norm(s) { return String(s || '').trim(); }
-    function eqi(a, b) { return norm(a).toLowerCase() === norm(b).toLowerCase(); }
-    function pluralMaybe(s) { return s.endsWith('s') ? s : s + 's'; }
-
-    // Category expansions for exact matches
-    const CATEGORY_ALIASES = {
-      'Door': ['Door', 'Doors'],
-      'Wall': ['Wall', 'Walls'],
-      'Window': ['Window', 'Windows'],
-      'Floor': ['Floor', 'Floors'],
-      'Roof': ['Roof', 'Roofs'],
-      'Curtain Panel': ['Curtain Panel', 'Curtain Panels'],
-      'Curtain Wall': ['Curtain Wall', 'Curtain Walls'],
-      'Structural Framing': ['Structural Framing'],
-      'Structural Columns': ['Structural Columns']
-    };
-    function expandCategoryTargets(word) {
-      const key = norm(word);
-      const list = CATEGORY_ALIASES[key];
-      if (list && list.length) return list.map(norm);
-      return [key, norm(pluralMaybe(key))];
+    // #rrggbb
+    if (s.startsWith('#') && s.length === 7) {
+      const r = clamp01(parseInt(s.slice(1, 3), 16) / 255);
+      const g = clamp01(parseInt(s.slice(3, 5), 16) / 255);
+      const b = clamp01(parseInt(s.slice(5, 7), 16) / 255);
+      return new THREE_REF.Vector4(r, g, b, a);
     }
 
-    // Color parsing, supports names, #rrggbb, 0xrrggbb, rgb(), rgba()
-    const NAMED = {
-      red:   '#ff0000', green: '#00ff00', blue:  '#0000ff',
-      yellow:'#ffff00', cyan:  '#00ffff', magenta:'#ff00ff',
-      orange:'#ffa500', purple:'#800080', pink:  '#ffc0cb',
-      gray:  '#808080', black: '#000000', white: '#ffffff'
-    };
-    function clamp01(x) { return Math.max(0, Math.min(1, x)); }
-
-    function colorStringToVec4(str, alphaDefault, THREE_REF) {
-      let a = typeof alphaDefault === 'number' ? alphaDefault : 0.85;
-      if (!str) return new THREE_REF.Vector4(0, 1, 0, a); // default green
-
-      let s = String(str).trim().toLowerCase();
-      if (NAMED[s]) s = NAMED[s];
-
-      // rgba(r,g,b,a)
-      let m = s.match(/^rgba?\s*\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})(?:\s*,\s*([0-9]*\.?[0-9]+))?\s*\)$/i);
-      if (m) {
-        const r = clamp01(parseInt(m[1], 10) / 255);
-        const g = clamp01(parseInt(m[2], 10) / 255);
-        const b = clamp01(parseInt(m[3], 10) / 255);
-        a = m[4] != null ? clamp01(parseFloat(m[4])) : a;
-        return new THREE_REF.Vector4(r, g, b, a);
-      }
-
-      // #rrggbb
-      if (s.startsWith('#') && s.length === 7) {
-        const r = clamp01(parseInt(s.slice(1, 3), 16) / 255);
-        const g = clamp01(parseInt(s.slice(3, 5), 16) / 255);
-        const b = clamp01(parseInt(s.slice(5, 7), 16) / 255);
-        return new THREE_REF.Vector4(r, g, b, a);
-      }
-
-      // 0xrrggbb
-      if (s.startsWith('0x') && s.length === 8) {
-        const val = parseInt(s, 16);
-        const r = clamp01(((val >> 16) & 0xff) / 255);
-        const g = clamp01(((val >> 8) & 0xff) / 255);
-        const b = clamp01((val & 0xff) / 255);
-        return new THREE_REF.Vector4(r, g, b, a);
-      }
-
-      // fallback to green
-      return new THREE_REF.Vector4(0, 1, 0, a);
+    // 0xrrggbb
+    if (s.startsWith('0x') && s.length === 8) {
+      const val = parseInt(s, 16);
+      const r = clamp01(((val >> 16) & 0xff) / 255);
+      const g = clamp01(((val >> 8) & 0xff) / 255);
+      const b = clamp01((val & 0xff) / 255);
+      return new THREE_REF.Vector4(r, g, b, a);
     }
 
-    // Build a map externalId -> color string from the provided array of single key objects
-    function buildExternalColorMap(list) {
-      const map = Object.create(null);
-      if (!Array.isArray(list)) return map;
-      for (let i = 0; i < list.length; i++) {
-        const obj = list[i];
-        if (obj && typeof obj === 'object') {
-          const keys = Object.keys(obj);
-          if (keys.length === 1) {
-            const extId = String(keys[0]);
-            const color = String(obj[extId] || '').trim();
-            if (extId && color) map[extId] = color;
-          }
+    // fallback to green
+    return new THREE_REF.Vector4(0, 1, 0, a);
+  }
+
+  // Build a map externalId -> color string from the provided array of single key objects
+  function buildExternalColorMap(list) {
+    const map = Object.create(null);
+    if (!Array.isArray(list)) return map;
+    for (let i = 0; i < list.length; i++) {
+      const obj = list[i];
+      if (obj && typeof obj === 'object') {
+        const keys = Object.keys(obj);
+        if (keys.length === 1) {
+          const extId = String(keys[0]);
+          const color = String(obj[extId] || '').trim();
+          if (extId && color) map[extId] = color;
         }
       }
-      return map;
+    }
+    return map;
+  }
+
+  // Disable analytics for sandbox iframes
+  try { Autodesk.Viewing.Private.analytics.optOut(); } catch (e) { /* ignore */ }
+
+  let viewer = null;
+  let loadedDocument = null;
+  let modelLoaded = null;
+
+  function populateViewDropdown() {
+    const dropdown = document.getElementById('viewDropdown');
+    dropdown.innerHTML = '';
+
+    const defaultOption = document.createElement('option');
+    defaultOption.value = '';
+    defaultOption.textContent = 'Default View';
+    defaultOption.selected = true;
+    dropdown.appendChild(defaultOption);
+
+    if (Array.isArray(VIEWABLES) && VIEWABLES.length > 0) {
+      VIEWABLES.forEach(function(viewable) {
+        const option = document.createElement('option');
+        option.value = viewable.guid;
+        option.textContent = viewable.name + ' (' + viewable.role + ')';
+        dropdown.appendChild(option);
+      });
+    } else {
+      const fallback = document.createElement('option');
+      fallback.value = '';
+      fallback.textContent = 'No additional views available';
+      dropdown.appendChild(fallback);
+    }
+  }
+
+  function applyExternalIdIsolationAndColoring() {
+    if (!viewer || !modelLoaded) {
+      return;
     }
 
-    // Disable analytics for sandbox iframes
-    try { Autodesk.Viewing.Private.analytics.optOut(); } catch (e) {}
-
-    let viewer = null;
-    let modelLoaded = null;
-
-    Autodesk.Viewing.Initializer(
-      { env: 'AutodeskProduction2', api: 'streamingV2', accessToken: ACCESS_TOKEN },
-      function () {
-        const container = document.getElementById('apsViewerDiv');
-        viewer = new Autodesk.Viewing.GuiViewer3D(container, { disableBimWalkInfoIcon: true });
-        viewer.start();
-        flog('Viewer started');
-
-        if (!DOCUMENT_URN) {
-          console.error('Missing URN, provide it via window.DOCUMENT_URN or the urn query param');
+    modelLoaded.getExternalIdMapping(
+      function onMap(map) {
+        if (!map) {
+          console.warn('[Filter] externalId map not available');
           return;
         }
 
-        Autodesk.Viewing.Document.load(
-          DOCUMENT_URN,
-          function onSuccess(doc) {
-            const node = doc.getRoot().getDefaultGeometry();
-            if (!node) { console.warn('No default geometry'); return; }
-            viewer.loadDocumentNode(doc, node, { keepCurrentModels: false }).then(function (model) {
-              modelLoaded = model;
-              flog('Model loaded');
+        const extColorMap = buildExternalColorMap(EXTERNAL_IDS);
+        const dbIds = [];
+        const rev = {};
 
-              // Instead of filtering by FILTER_ELEMENT, isolate and color by EXTERNAL_IDS
-              modelLoaded.getExternalIdMapping(
-                function onMap(map) {
-                  if (!map) {
-                    console.warn('[Filter] externalId map not available');
-                    return;
-                  }
-                  const dbIds = [];
-                  const extColorMap = buildExternalColorMap(EXTERNAL_IDS);
-                  const rev = {}; // dbId -> externalId
-                  for (const extId in map) {
-                    if (Object.prototype.hasOwnProperty.call(map, extId)) {
-                      rev[ map[extId] ] = extId;
-                    }
-                  }
-                  // Collect dbIds for all external IDs in EXTERNAL_IDS
-                  for (const extId in extColorMap) {
-                    if (map[extId]) {
-                      dbIds.push(map[extId]);
-                    }
-                  }
-                  if (dbIds.length === 0) {
-                    console.info('No dbIds match EXTERNAL_IDS');
-                    return;
-                  }
-                  viewer.clearThemingColors();
-                  viewer.isolate(dbIds);
-                  viewer.fitToView(dbIds);
-                  // Default color for all matches
-                  const THREE_REF = (Autodesk && Autodesk.Viewing && Autodesk.Viewing.Private && Autodesk.Viewing.Private.THREE) || window.THREE;
-                  const defaultV4 = colorStringToVec4('green', 0.85, THREE_REF);
-                  for (let i = 0; i < dbIds.length; i++) {
-                    viewer.setThemingColor(dbIds[i], defaultV4, modelLoaded, false);
-                  }
-                  // Apply overrides from extColorMap
-                  for (let i = 0; i < dbIds.length; i++) {
-                    const dbId = dbIds[i];
-                    const ext = rev[dbId];
-                    if (ext && extColorMap[ext]) {
-                      const v4 = colorStringToVec4(extColorMap[ext], 0.95, THREE_REF);
-                      viewer.setThemingColor(dbId, v4, modelLoaded, false);
-                    }
-                  }
-                  viewer.impl.invalidate(true, true, true);
-                },
-                function onErr(err) {
-                  console.error('[Filter] getExternalIdMapping failed', err);
-                }
-              );
-            });
-          },
-          function onFailure(code, message) {
-            console.error('Document load failed:', code, message);
+        for (const extId in map) {
+          if (Object.prototype.hasOwnProperty.call(map, extId)) {
+            rev[map[extId]] = extId;
           }
-        );
+        }
+
+        for (const extId in extColorMap) {
+          if (map[extId]) {
+            dbIds.push(map[extId]);
+          }
+        }
+
+        if (dbIds.length === 0) {
+          console.info('No dbIds match EXTERNAL_IDS');
+          return;
+        }
+
+        viewer.clearThemingColors();
+        viewer.isolate(dbIds);
+        viewer.fitToView(dbIds);
+
+        const THREE_REF = (Autodesk && Autodesk.Viewing && Autodesk.Viewing.Private && Autodesk.Viewing.Private.THREE) || window.THREE;
+        const defaultV4 = colorStringToVec4(null, 0.85, THREE_REF);
+        for (let i = 0; i < dbIds.length; i++) {
+          viewer.setThemingColor(dbIds[i], defaultV4, modelLoaded, false);
+        }
+
+        for (let i = 0; i < dbIds.length; i++) {
+          const dbId = dbIds[i];
+          const ext = rev[dbId];
+          if (ext && extColorMap[ext]) {
+            const v4 = colorStringToVec4(extColorMap[ext], 0.95, THREE_REF);
+            viewer.setThemingColor(dbId, v4, modelLoaded, false);
+          }
+        }
+
+        viewer.impl.invalidate(true, true, true);
+      },
+      function onErr(err) {
+        console.error('[Filter] getExternalIdMapping failed', err);
       }
     );
+  }
 
-    function applyFilterWord(word) {
-      if (!viewer || !modelLoaded) {
-        console.warn('[Filter] Viewer or model not ready');
+  function loadViewByGuid(guid) {
+    if (!viewer || !loadedDocument) return;
+
+    const root = loadedDocument.getRoot();
+    let node = null;
+
+    if (guid) {
+      node = root.findByGuid(guid);
+    }
+
+    if (!node) {
+      node = root.getDefaultGeometry();
+    }
+
+    if (!node) {
+      console.warn('No viewable geometry found.');
+      return;
+    }
+
+    viewer.loadDocumentNode(loadedDocument, node, { keepCurrentModels: false })
+      .then(function(model) {
+        modelLoaded = model;
+        applyExternalIdIsolationAndColoring();
+        console.log('View loaded successfully:', guid || 'default');
+      })
+      .catch(function(e) {
+        console.error('Error loading view:', e);
+      });
+  }
+
+  Autodesk.Viewing.Initializer(
+    { env: 'AutodeskProduction2', api: 'streamingV2', accessToken: ACCESS_TOKEN },
+    function () {
+      const container = document.getElementById('apsViewerDiv');
+      viewer = new Autodesk.Viewing.GuiViewer3D(container, { disableBimWalkInfoIcon: true });
+      viewer.start();
+
+      if (!DOCUMENT_URN) {
+        console.error('Missing URN, provide it via window.DOCUMENT_URN or the urn query param');
         return;
       }
 
-      const THREE_REF = (Autodesk && Autodesk.Viewing && Autodesk.Viewing.Private && Autodesk.Viewing.Private.THREE) || window.THREE;
-      const target = norm(word);
-      if (!target) return;
+      Autodesk.Viewing.Document.load(
+        DOCUMENT_URN,
+        function onSuccess(doc) {
+          loadedDocument = doc;
+          populateViewDropdown();
+          loadViewByGuid('');
 
-      flog('applyFilterWord called with:', word, '| normalized:', target);
-      flog('Starting search for target across properties:', ['Name','Category','Family','Family Name','Type Name']);
-
-      viewer.search(
-        target,
-        function onSearch(dbids) {
-          flog('Search returned hits:', (dbids && dbids.length) || 0);
-          if (!dbids || dbids.length === 0) {
-            console.info('No search hits for', target);
-            return;
-          }
-
-          modelLoaded.getBulkProperties(
-            dbids,
-            { propFilter: ['Name', 'Category', 'Family', 'Family Name', 'Type Name'] },
-            function onProps(results) {
-              flog('Evaluating exact matches among results:', results.length);
-              const wanted = [];
-              const catTargets = new Set(expandCategoryTargets(target).map(function (x) { return x.toLowerCase(); }));
-
-              for (let i = 0; i < results.length; i++) {
-                const r = results[i], props = r.properties || [], map = {};
-                for (let j = 0; j < props.length; j++) {
-                  const p = props[j];
-                  map[p.displayName] = norm(p.displayValue);
-                }
-
-                const nameVal = map['Name'] || '';
-                const catVal  = map['Category'] || '';
-                const famVal1 = map['Family'] || '';
-                const famVal2 = map['Family Name'] || '';
-                const typeVal = map['Type Name'] || '';
-
-                let exact = false, reason = null;
-                if (eqi(nameVal, target)) { exact = true; reason = 'name'; }
-                else if (catTargets.has(catVal.toLowerCase())) { exact = true; reason = 'category'; }
-                else if (eqi(famVal1, target)) { exact = true; reason = 'family'; }
-                else if (eqi(famVal2, target)) { exact = true; reason = 'family name'; }
-                else if (eqi(typeVal, target)) { exact = true; reason = 'type'; }
-
-                if (exact) {
-                  wanted.push(r.dbId);
-                  if (DEBUG_FILTER_VERBOSE) flog('Match', { dbId: r.dbId, name: nameVal, cat: catVal, fam: famVal1 || famVal2, type: typeVal, reason: reason });
-                } else if (DEBUG_FILTER_VERBOSE) {
-                  flog('No match', { dbId: r.dbId, name: nameVal, cat: catVal, fam: famVal1 || famVal2, type: typeVal });
-                }
-              }
-
-              if (wanted.length === 0) {
-                // Fallback to Name contains
-                let fallbackCount = 0;
-                for (let k = 0; k < results.length; k++) {
-                  const rp = results[k].properties || [];
-                  for (let u = 0; u < rp.length; u++) {
-                    if (rp[u].displayName === 'Name') {
-                      const val = norm(rp[u].displayValue).toLowerCase();
-                      if (val.indexOf(target.toLowerCase()) !== -1) {
-                        wanted.push(results[k].dbId);
-                        fallbackCount++;
-                        if (DEBUG_FILTER_VERBOSE) flog('Fallback match (Name contains)', { dbId: results[k].dbId, name: norm(rp[u].displayValue) });
-                      }
-                      break;
-                    }
-                  }
-                }
-                flog('Fallback (Name contains) match count:', fallbackCount);
-              }
-
-              if (wanted.length === 0) {
-                console.info('No elements match', target);
-                return;
-              }
-
-              // Isolate matches
-              viewer.clearThemingColors();
-              viewer.isolate(wanted);
-              viewer.fitToView(wanted);
-              console.info('Isolated', wanted.length, 'elements for', target);
-
-              // Build external → dbId and reverse, then theme
-              modelLoaded.getExternalIdMapping(
-                function onMap(map) {
-                  if (!map) {
-                    console.warn('[Filter] externalId map not available');
-                    return;
-                  }
-                  const rev = {};                  // dbId → externalId
-                  for (const extId in map) {
-                    if (Object.prototype.hasOwnProperty.call(map, extId)) {
-                      rev[ map[extId] ] = extId;
-                    }
-                  }
-
-                  // Log dbId and externalId for the matches
-                  wanted.forEach(function (dbId) {
-                    const ext = rev[dbId] || null;
-                    console.log('[Filter] dbId', dbId, 'externalId', ext);
-                  });
-
-                  // Default color for all matches
-                  const defaultV4 = colorStringToVec4('green', 0.85, THREE_REF);
-
-                  // Per external id overrides
-                  const extColorMap = buildExternalColorMap(EXTERNAL_IDS);
-
-                  // First apply default green to every wanted dbId
-                  for (let i = 0; i < wanted.length; i++) {
-                    viewer.setThemingColor(wanted[i], defaultV4, modelLoaded, false);
-                  }
-
-                  // Then apply overrides where present
-                  const overridden = [];
-                  for (let i = 0; i < wanted.length; i++) {
-                    const dbId = wanted[i];
-                    const ext = rev[dbId];
-                    if (ext && extColorMap[ext]) {
-                      const v4 = colorStringToVec4(extColorMap[ext], 0.95, THREE_REF);
-                      viewer.setThemingColor(dbId, v4, modelLoaded, false);
-                      overridden.push({ dbId, ext, color: extColorMap[ext] });
-                    }
-                  }
-
-                  if (overridden.length) {
-                    flog('Applied overrides for', overridden.length, 'elements', overridden);
-                  } else {
-                    flog('No overrides matched the current selection');
-                  }
-
-                  // Force redraw
-                  viewer.impl.invalidate(true, true, true);
-                },
-                function onErr(err) {
-                  console.error('[Filter] getExternalIdMapping failed', err);
-                }
-              );
-            },
-            function onPropsErr(e) {
-              console.error('getBulkProperties failed', e);
-            }
-          );
+          document.getElementById('viewDropdown').addEventListener('change', function(e) {
+            loadViewByGuid(e.target.value);
+          });
         },
-        function onSearchErr(e) { console.error('search failed', e); },
-        ['Name', 'Category', 'Family', 'Family Name', 'Type Name']
+        function onFailure(code, message) {
+          console.error('Document load failed:', code, message);
+        }
       );
     }
+  );
 
-    // Optional, quick manual trigger in console:
-    // applyFilterWord('Walls');
   </script>
 </body>
 </html>

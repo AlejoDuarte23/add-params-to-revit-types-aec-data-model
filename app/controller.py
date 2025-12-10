@@ -22,6 +22,7 @@ from app.helpers import (
     DEFAULT_REVIT_VERSION,
     fetch_manifest,
     get_revit_version_from_manifest,
+    get_viewables_from_urn,
     get_type_parameters_signature,
 )
 
@@ -493,11 +494,18 @@ class Controller(vkt.Controller):
 
         external_ids = [{ext_id: color} for ext_id, color in external_id_color_map.items()]
 
+        viewables: List[dict[str, Any]] = []
+        try:
+            viewables = get_viewables_from_urn(info["token"], urn_bs64)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: Could not fetch viewables: {exc}")
+
         html_path = Path(__file__).resolve().parent / "ApsViewer.html"
         html = html_path.read_text(encoding="utf-8")
         html = html.replace("APS_TOKEN_PLACEHOLDER", info["token"])
         html = html.replace("URN_PLACEHOLDER", urn_bs64)
         html = html.replace("EXTERNAL_IDS_PLACEHOLDER", json.dumps(external_ids))
+        html = html.replace("VIEWABLES_PLACEHOLDER", json.dumps(viewables))
 
         return vkt.WebResult(html=html)
 
