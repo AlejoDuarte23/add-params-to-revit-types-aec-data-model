@@ -415,13 +415,9 @@ class Parametrization(vkt.Parametrization):
         textwrap.dedent(
             """\
             ## Run Automation
-            Select a model and trigger the automation workflow (coming soon).
+            Trigger the automation workflow using the model selected above.
             """
         )
-    )
-    run_automation.autodesk_file = vkt.AutodeskFileField(
-        "Revit model",
-        oauth2_integration="aps-integration-automation-v2",
     )
     run_automation.break_line = vkt.LineBreak()
     run_automation.trigger = vkt.ActionButton("Run Automation", method="trigger_run_automation")
@@ -511,9 +507,9 @@ class Controller(vkt.Controller):
         integration = vkt.external.OAuth2Integration("aps-integration-automation-v2")
         token = integration.get_access_token()
 
-        autodesk_file = getattr(getattr(params, "run_automation", None), "autodesk_file", None)
+        autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
         if not autodesk_file:
-            raise vkt.UserError("Select a model in the Run Automation section first")
+            raise vkt.UserError("Select a model in the Autodesk Model section first")
 
         project_id = getattr(autodesk_file, "project_id", None)
         file_urn = getattr(autodesk_file, "urn", None)
