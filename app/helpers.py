@@ -113,35 +113,56 @@ def get_viewables_from_urn(token:str, object_urn: str) -> list[dict[str, Any]]:
     response.raise_for_status()
     
     manifest = response.json()
-    viewables = []
-    
-    def extract_viewables(children: list, parent_name: str = ""):
-        """Recursively extract viewables from manifest children."""
-        for child in children:
-            role = child.get("role", "")
-            guid = child.get("guid", "")
-            name = child.get("name", "Unnamed View")
-            
-            # Viewables typically have role '3d' or '2d'
-            if role in ["3d", "2d"] and guid:
-                viewables.append({
-                    "guid": guid,
-                    "name": name,
-                    "role": role
-                })
-            
-            # Recurse into nested children
-            if "children" in child:
-                extract_viewables(child["children"], name)
-    
-    # Process derivatives
+    viewables: list[dict[str, Any]] = []
+
+    def clean_name(name: str) -> str:
+        """Normalize view name by stripping cosmetic prefixes."""
+        return name.replace("[3D] ", "").replace("[2D] ", "").strip()
+
+    # Prefer a single derivative tree (svf2 first, then svf) to avoid double-processing
     derivatives = manifest.get("derivatives", [])
-    for derivative in derivatives:
-        children = derivative.get("children", [])
-        extract_viewables(children)
-    
-    print(f"Found {len(viewables)} viewable(s) in manifest")
-    
+    derivative = next(
+        (d for d in derivatives if d.get("outputType") == "svf2"),
+        next((d for d in derivatives if d.get("outputType") == "svf"), None),
+    )
+
+    if not derivative:
+        print("No svf/svf2 derivative found in manifest")
+        return viewables
+
+    seen: set[tuple[str, str]] = set()  # (guid, display_name)
+    for geom in derivative.get("children", []):
+        if geom.get("type") != "geometry":
+            continue
+        role = geom.get("role", "")
+        if role not in ["3d", "2d"]:
+            continue
+        guid = geom.get("guid")
+        if not guid:
+            continue
+
+        base_name = geom.get("name", "") or "Unnamed View"
+        candidate_names = [base_name]
+        for child in geom.get("children", []):
+            if child.get("type") == "view":
+                candidate_names.append(child.get("name") or base_name)
+
+        display_name = None
+        for name in candidate_names:
+            cleaned = clean_name(name)
+            if cleaned:
+                display_name = cleaned
+                break
+        if not display_name:
+            display_name = base_name or "Unnamed View"
+
+        key = (guid, display_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        viewables.append({"guid": guid, "name": display_name, "role": role})
+
+
     return viewables
 
 
