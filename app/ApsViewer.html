@@ -59,48 +59,7 @@
   var DOCUMENT_URN = 'urn:URN_PLACEHOLDER';
   var VIEWABLES = VIEWABLES_PLACEHOLDER;
 
-  // Debug flags
-  const DEBUG_FILTER = true;
-  const DEBUG_FILTER_VERBOSE = true;
-
-  function flog() {
-    if (!DEBUG_FILTER) return;
-    const args = Array.prototype.slice.call(arguments);
-    args.unshift('[Filter]');
-    console.log.apply(console, args);
-  }
-
-  // Simple helpers
-  function norm(s) { return String(s || '').trim(); }
-  function eqi(a, b) { return norm(a).toLowerCase() === norm(b).toLowerCase(); }
-  function pluralMaybe(s) { return s.endsWith('s') ? s : s + 's'; }
-
-  // Category expansions for exact matches
-  const CATEGORY_ALIASES = {
-    'Door': ['Door', 'Doors'],
-    'Wall': ['Wall', 'Walls'],
-    'Window': ['Window', 'Windows'],
-    'Floor': ['Floor', 'Floors'],
-    'Roof': ['Roof', 'Roofs'],
-    'Curtain Panel': ['Curtain Panel', 'Curtain Panels'],
-    'Curtain Wall': ['Curtain Wall', 'Curtain Walls'],
-    'Structural Framing': ['Structural Framing'],
-    'Structural Columns': ['Structural Columns']
-  };
-  function expandCategoryTargets(word) {
-    const key = norm(word);
-    const list = CATEGORY_ALIASES[key];
-    if (list && list.length) return list.map(norm);
-    return [key, norm(pluralMaybe(key))];
-  }
-
-  // Color parsing, supports names, #rrggbb, 0xrrggbb, rgb(), rgba()
-  const NAMED = {
-    red:   '#ff0000', green: '#00ff00', blue:  '#0000ff',
-    yellow:'#ffff00', cyan:  '#00ffff', magenta:'#ff00ff',
-    orange:'#ffa500', purple:'#800080', pink:  '#ffc0cb',
-    gray:  '#808080', black: '#000000', white: '#ffffff'
-  };
+  // Color parsing, supports #rrggbb, 0xrrggbb, rgb(), rgba(); hex is what the backend sends
   function clamp01(x) { return Math.max(0, Math.min(1, x)); }
 
   function colorStringToVec4(str, alphaDefault, THREE_REF) {
@@ -108,7 +67,6 @@
     if (!str) return new THREE_REF.Vector4(0, 1, 0, a); // default green
 
     let s = String(str).trim().toLowerCase();
-    if (NAMED[s]) s = NAMED[s];
 
     // rgba(r,g,b,a)
     let m = s.match(/^rgba?\s*\(\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})\s*,\s*([0-9]{1,3})(?:\s*,\s*([0-9]*\.?[0-9]+))?\s*\)$/i);
@@ -229,7 +187,7 @@
         viewer.fitToView(dbIds);
 
         const THREE_REF = (Autodesk && Autodesk.Viewing && Autodesk.Viewing.Private && Autodesk.Viewing.Private.THREE) || window.THREE;
-        const defaultV4 = colorStringToVec4('green', 0.85, THREE_REF);
+        const defaultV4 = colorStringToVec4(null, 0.85, THREE_REF);
         for (let i = 0; i < dbIds.length; i++) {
           viewer.setThemingColor(dbIds[i], defaultV4, modelLoaded, false);
         }
@@ -287,7 +245,6 @@
       const container = document.getElementById('apsViewerDiv');
       viewer = new Autodesk.Viewing.GuiViewer3D(container, { disableBimWalkInfoIcon: true });
       viewer.start();
-      flog('Viewer started');
 
       if (!DOCUMENT_URN) {
         console.error('Missing URN, provide it via window.DOCUMENT_URN or the urn query param');
@@ -312,164 +269,6 @@
     }
   );
 
-  function applyFilterWord(word) {
-    if (!viewer || !modelLoaded) {
-      console.warn('[Filter] Viewer or model not ready');
-      return;
-    }
-
-    const THREE_REF = (Autodesk && Autodesk.Viewing && Autodesk.Viewing.Private && Autodesk.Viewing.Private.THREE) || window.THREE;
-    const target = norm(word);
-    if (!target) return;
-
-    flog('applyFilterWord called with:', word, '| normalized:', target);
-    flog('Starting search for target across properties:', ['Name','Category','Family','Family Name','Type Name']);
-
-    viewer.search(
-      target,
-      function onSearch(dbids) {
-        flog('Search returned hits:', (dbids && dbids.length) || 0);
-        if (!dbids || dbids.length === 0) {
-          console.info('No search hits for', target);
-          return;
-        }
-
-        modelLoaded.getBulkProperties(
-          dbids,
-          { propFilter: ['Name', 'Category', 'Family', 'Family Name', 'Type Name'] },
-          function onProps(results) {
-            flog('Evaluating exact matches among results:', results.length);
-            const wanted = [];
-            const catTargets = new Set(expandCategoryTargets(target).map(function (x) { return x.toLowerCase(); }));
-
-            for (let i = 0; i < results.length; i++) {
-              const r = results[i], props = r.properties || [], map = {};
-              for (let j = 0; j < props.length; j++) {
-                const p = props[j];
-                map[p.displayName] = norm(p.displayValue);
-              }
-
-              const nameVal = map['Name'] || '';
-              const catVal  = map['Category'] || '';
-              const famVal1 = map['Family'] || '';
-              const famVal2 = map['Family Name'] || '';
-              const typeVal = map['Type Name'] || '';
-
-              let exact = false, reason = null;
-              if (eqi(nameVal, target)) { exact = true; reason = 'name'; }
-              else if (catTargets.has(catVal.toLowerCase())) { exact = true; reason = 'category'; }
-              else if (eqi(famVal1, target)) { exact = true; reason = 'family'; }
-              else if (eqi(famVal2, target)) { exact = true; reason = 'family name'; }
-              else if (eqi(typeVal, target)) { exact = true; reason = 'type'; }
-
-              if (exact) {
-                wanted.push(r.dbId);
-                if (DEBUG_FILTER_VERBOSE) flog('Match', { dbId: r.dbId, name: nameVal, cat: catVal, fam: famVal1 || famVal2, type: typeVal, reason: reason });
-              } else if (DEBUG_FILTER_VERBOSE) {
-                flog('No match', { dbId: r.dbId, name: nameVal, cat: catVal, fam: famVal1 || famVal2, type: typeVal });
-              }
-            }
-
-            if (wanted.length === 0) {
-              // Fallback to Name contains
-              let fallbackCount = 0;
-              for (let k = 0; k < results.length; k++) {
-                const rp = results[k].properties || [];
-                for (let u = 0; u < rp.length; u++) {
-                  if (rp[u].displayName === 'Name') {
-                    const val = norm(rp[u].displayValue).toLowerCase();
-                    if (val.indexOf(target.toLowerCase()) !== -1) {
-                      wanted.push(results[k].dbId);
-                      fallbackCount++;
-                      if (DEBUG_FILTER_VERBOSE) flog('Fallback match (Name contains)', { dbId: results[k].dbId, name: norm(rp[u].displayValue) });
-                    }
-                    break;
-                  }
-                }
-              }
-              flog('Fallback (Name contains) match count:', fallbackCount);
-            }
-
-            if (wanted.length === 0) {
-              console.info('No elements match', target);
-              return;
-            }
-
-            // Isolate matches
-            viewer.clearThemingColors();
-            viewer.isolate(wanted);
-            viewer.fitToView(wanted);
-            console.info('Isolated', wanted.length, 'elements for', target);
-
-            // Build external → dbId and reverse, then theme
-            modelLoaded.getExternalIdMapping(
-              function onMap(map) {
-                if (!map) {
-                  console.warn('[Filter] externalId map not available');
-                  return;
-                }
-                const rev = {};                  // dbId → externalId
-                for (const extId in map) {
-                  if (Object.prototype.hasOwnProperty.call(map, extId)) {
-                    rev[ map[extId] ] = extId;
-                  }
-                }
-
-                // Log dbId and externalId for the matches
-                wanted.forEach(function (dbId) {
-                  const ext = rev[dbId] || null;
-                  console.log('[Filter] dbId', dbId, 'externalId', ext);
-                });
-
-                // Default color for all matches
-                const defaultV4 = colorStringToVec4('green', 0.85, THREE_REF);
-
-                // Per external id overrides
-                const extColorMap = buildExternalColorMap(EXTERNAL_IDS);
-
-                // First apply default green to every wanted dbId
-                for (let i = 0; i < wanted.length; i++) {
-                  viewer.setThemingColor(wanted[i], defaultV4, modelLoaded, false);
-                }
-
-                // Then apply overrides where present
-                const overridden = [];
-                for (let i = 0; i < wanted.length; i++) {
-                  const dbId = wanted[i];
-                  const ext = rev[dbId];
-                  if (ext && extColorMap[ext]) {
-                    const v4 = colorStringToVec4(extColorMap[ext], 0.95, THREE_REF);
-                    viewer.setThemingColor(dbId, v4, modelLoaded, false);
-                    overridden.push({ dbId, ext, color: extColorMap[ext] });
-                  }
-                }
-
-                if (overridden.length) {
-                  flog('Applied overrides for', overridden.length, 'elements', overridden);
-                } else {
-                  flog('No overrides matched the current selection');
-                }
-
-                // Force redraw
-                viewer.impl.invalidate(true, true, true);
-              },
-              function onErr(err) {
-                console.error('[Filter] getExternalIdMapping failed', err);
-              }
-            );
-          },
-          function onPropsErr(e) {
-            console.error('getBulkProperties failed', e);
-          }
-        );
-      },
-      function onSearchErr(e) { console.error('search failed', e); },
-      ['Name', 'Category', 'Family', 'Family Name', 'Type Name']
-    );
-  }
-
-  // Optional, quick manual trigger in console:
-  // applyFilterWord('Walls');
   </script>
 </body>
 </html>
