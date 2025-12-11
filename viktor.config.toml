@@ -1,6 +1,6 @@
 app_type = "simple"
 python_version = "3.13"
-registered_name = "add-params-to-revit-type-aec-data-model"
+registered_name = "dx-add-params-to-revit-types"
 oauth2_integrations = [
   "aps-integration-automation-v2"
 ]
