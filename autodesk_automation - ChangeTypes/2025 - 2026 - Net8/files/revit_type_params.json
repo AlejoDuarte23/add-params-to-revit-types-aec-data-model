@@ -1,11 +1,11 @@
 {
-  "ParameterName": "wombat",
-  "ParameterGroup": "PG_DATA",
+  "ParameterName": "Keynote",
+  "ParameterGroup": "PG_IDENTITY_DATA",
   "Targets": [
     {
       "TypeName": "CL_W1",
       "FamilyName": "Basic Wall",
-      "Value": "95"
+      "Value": "Viktor"
     }
   ]
 }
