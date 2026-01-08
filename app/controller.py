@@ -16,6 +16,7 @@ from aps_automation_sdk.classes import (
     ActivityOutputParameterAcc,
     WorkItemAcc,
 )
+from aps_viewer_sdk import APSViewer
 from dotenv import load_dotenv
 
 from app.helpers import (
@@ -353,6 +354,29 @@ def get_parameter_options(params, **kwargs):
     return sorted(set(parameter_names)) if parameter_names else []
 
 
+def get_export_view_options(params, **kwargs):
+    """Get option list elements for available views to export as IFC."""
+    info = get_model_info(params, **kwargs)
+    if not info:
+        return []
+
+    try:
+        viewables = get_viewables_from_urn(info["token"], info["urn_bs64"])
+        if not viewables:
+            return []
+        
+        options = []
+        for viewable in viewables:
+            name = viewable.get("name", "Unknown View")
+            role = viewable.get("role", "")
+            label = f"{name} ({role})" if role else name
+            options.append(vkt.OptionListElement(label=label, value=name))
+        
+        return options
+    except Exception:
+        return []
+
+
 class Parametrization(vkt.Parametrization):
     model = vkt.Section("Autodesk Model")
     model.intro = vkt.Text(
@@ -411,6 +435,7 @@ class Parametrization(vkt.Parametrization):
         "Color", default=vkt.Color(0, 153, 255)
     )
 
+
     run_automation = vkt.Section("Run Automation")
     run_automation.title = vkt.Text(
         textwrap.dedent(
@@ -423,6 +448,18 @@ class Parametrization(vkt.Parametrization):
     run_automation.break_line = vkt.LineBreak()
     run_automation.trigger = vkt.ActionButton("Run Automation", method="trigger_run_automation")
 
+    export_ifc_section = vkt.Section("Export IFC")
+    export_ifc_section.title = vkt.Text(
+        textwrap.dedent(
+            """\
+            ## Export IFC
+            Select the views you want to export to IFC format.
+            """
+        )
+    )
+    export_ifc_section.export_views = vkt.MultiSelectField(
+        "Views to Export", options=get_export_view_options
+    )
 
 def _encode_urn(raw_urn: str) -> str:
     """Return urlsafe base64 encoding (keep padding) for Forge URNs."""
@@ -494,19 +531,38 @@ class Controller(vkt.Controller):
 
         external_ids = [{ext_id: color} for ext_id, color in external_id_color_map.items()]
 
+        # Get viewables for view selection
         viewables: List[dict[str, Any]] = []
         try:
             viewables = get_viewables_from_urn(info["token"], urn_bs64)
         except Exception as exc:  # noqa: BLE001
             print(f"Warning: Could not fetch viewables: {exc}")
 
-        html_path = Path(__file__).resolve().parent / "ApsViewer.html"
-        html = html_path.read_text(encoding="utf-8")
-        html = html.replace("APS_TOKEN_PLACEHOLDER", info["token"])
-        html = html.replace("URN_PLACEHOLDER", urn_bs64)
-        html = html.replace("EXTERNAL_IDS_PLACEHOLDER", json.dumps(external_ids))
-        html = html.replace("VIEWABLES_PLACEHOLDER", json.dumps(viewables))
+        # Use aps-viewer-sdk to create the viewer
+        autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
+        version = autodesk_file.get_latest_version(info["token"])
+        viewer = APSViewer(urn=version.urn, token=info["token"])
 
+        # Select the first 3D view if available
+        if viewables:
+            first_3d_view = next((v for v in viewables if v.get("role") == "3d"), None)
+            if first_3d_view:
+                viewer.set_view_guid(
+                    first_3d_view["guid"],
+                    first_3d_view["name"],
+                    first_3d_view["role"]
+                )
+
+        # Highlight elements with their assigned colors
+        if external_ids:
+            highlight_elements = [
+                {"externalElementId": ext_id, "color": color}
+                for item in external_ids
+                for ext_id, color in item.items()
+            ]
+            viewer.highlight_elements(highlight_elements)
+
+        html = viewer.write()
         return vkt.WebResult(html=html)
 
     def trigger_run_automation(self, params, **kwargs):
