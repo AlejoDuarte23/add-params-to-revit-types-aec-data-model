@@ -119,6 +119,33 @@ IFC_EXPORT_VERSION_CONFIG = {
 }
 
 
+def get_ifc_export_signature(revit_version: str | None) -> tuple[str, str]:
+    """Get the activity signature and full alias for IFC Export based on Revit version.
+    revit_version: The Revit version string (e.g., "2023", "2024", "2025", "2026")
+    Returns tuple: (signature, activity_full_alias)
+    """
+    if revit_version is None:
+        revit_version = DEFAULT_REVIT_VERSION
+    
+    if revit_version not in IFC_EXPORT_VERSION_CONFIG:
+        supported = ", ".join(IFC_EXPORT_VERSION_CONFIG.keys())
+        raise ValueError(
+            f"Revit version '{revit_version}' is not supported for IFC export. "
+            f"Supported versions: {supported}"
+        )
+    
+    config = IFC_EXPORT_VERSION_CONFIG[revit_version]
+    signature = config["signature"]
+    activity_full_alias = config["activity_full_alias"]
+    
+    if not signature:
+        raise ValueError(f"Missing environment variable: RevitIfcExportAppActivity{revit_version}")
+    if not activity_full_alias:
+        raise ValueError(f"Missing environment variable: ACTIVITY_FULL_ALIAS_IfcExport{revit_version}")
+    
+    return signature, activity_full_alias
+
+
 def get_viewables_from_urn(token:str, object_urn: str) -> list[dict[str, Any]]:
     """
     Get available viewables (views) from a translated model.
