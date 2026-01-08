@@ -16,11 +16,14 @@ from aps_automation_sdk.classes import (
     ActivityOutputParameterAcc,
     WorkItemAcc,
 )
+from aps_viewer_sdk import APSViewer
 from dotenv import load_dotenv
 
 from app.helpers import (
     DEFAULT_REVIT_VERSION,
+    create_ifc_export_json,
     fetch_manifest,
+    get_ifc_export_signature,
     get_revit_version_from_manifest,
     get_viewables_from_urn,
     get_type_parameters_signature,
@@ -353,6 +356,29 @@ def get_parameter_options(params, **kwargs):
     return sorted(set(parameter_names)) if parameter_names else []
 
 
+def get_export_view_options(params, **kwargs):
+    """Get option list elements for available views to export as IFC."""
+    info = get_model_info(params, **kwargs)
+    if not info:
+        return []
+
+    try:
+        viewables = get_viewables_from_urn(info["token"], info["urn_bs64"])
+        if not viewables:
+            return []
+        
+        options = []
+        for viewable in viewables:
+            name = viewable.get("name", "Unknown View")
+            role = viewable.get("role", "")
+            label = f"{name} ({role})" if role else name
+            options.append(vkt.OptionListElement(label=label, value=name))
+        
+        return options
+    except Exception:
+        return []
+
+
 class Parametrization(vkt.Parametrization):
     model = vkt.Section("Autodesk Model")
     model.intro = vkt.Text(
@@ -411,6 +437,7 @@ class Parametrization(vkt.Parametrization):
         "Color", default=vkt.Color(0, 153, 255)
     )
 
+
     run_automation = vkt.Section("Run Automation")
     run_automation.title = vkt.Text(
         textwrap.dedent(
@@ -422,6 +449,21 @@ class Parametrization(vkt.Parametrization):
     )
     run_automation.break_line = vkt.LineBreak()
     run_automation.trigger = vkt.ActionButton("Run Automation", method="trigger_run_automation")
+
+    export_ifc_section = vkt.Section("Export IFC")
+    export_ifc_section.title = vkt.Text(
+        textwrap.dedent(
+            """\
+            ## Export IFC
+            Select the views you want to export to IFC format.
+            """
+        )
+    )
+    export_ifc_section.export_views = vkt.MultiSelectField(
+        "Views to Export", options=get_export_view_options
+    )
+    export_ifc_section.break_line = vkt.LineBreak()
+    export_ifc_section.export_button = vkt.ActionButton("Export to IFC", method="export_to_ifc")
 
 
 def _encode_urn(raw_urn: str) -> str:
@@ -494,19 +536,38 @@ class Controller(vkt.Controller):
 
         external_ids = [{ext_id: color} for ext_id, color in external_id_color_map.items()]
 
+        # Get viewables for view selection
         viewables: List[dict[str, Any]] = []
         try:
             viewables = get_viewables_from_urn(info["token"], urn_bs64)
         except Exception as exc:  # noqa: BLE001
             print(f"Warning: Could not fetch viewables: {exc}")
 
-        html_path = Path(__file__).resolve().parent / "ApsViewer.html"
-        html = html_path.read_text(encoding="utf-8")
-        html = html.replace("APS_TOKEN_PLACEHOLDER", info["token"])
-        html = html.replace("URN_PLACEHOLDER", urn_bs64)
-        html = html.replace("EXTERNAL_IDS_PLACEHOLDER", json.dumps(external_ids))
-        html = html.replace("VIEWABLES_PLACEHOLDER", json.dumps(viewables))
+        # Use aps-viewer-sdk to create the viewer
+        autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
+        version = autodesk_file.get_latest_version(info["token"])
+        viewer = APSViewer(urn=version.urn, token=info["token"])
 
+        # Select the first 3D view if available
+        if viewables:
+            first_3d_view = next((v for v in viewables if v.get("role") == "3d"), None)
+            if first_3d_view:
+                viewer.set_view_guid(
+                    first_3d_view["guid"],
+                    first_3d_view["name"],
+                    first_3d_view["role"]
+                )
+
+        # Highlight elements with their assigned colors
+        if external_ids:
+            highlight_elements = [
+                {"externalElementId": ext_id, "color": color}
+                for item in external_ids
+                for ext_id, color in item.items()
+            ]
+            viewer.highlight_elements(highlight_elements)
+
+        html = viewer.write()
         return vkt.WebResult(html=html)
 
     def trigger_run_automation(self, params, **kwargs):
@@ -636,3 +697,172 @@ class Controller(vkt.Controller):
             success_msg += f"\nReport URL: {report_url}"
 
         vkt.UserMessage.success(success_msg)
+
+    def export_to_ifc(self, params, **kwargs):
+        """
+        Export the Revit model to IFC format using Design Automation with ACC.
+        """
+        # Get OAuth2 integration for APS
+        integration = vkt.external.OAuth2Integration("aps-integration-automation-v2")
+        access_token = integration.get_access_token()
+
+        try:
+            vkt.UserMessage.info("Starting IFC Export workflow with ACC...")
+            vkt.progress_message("Preparing files...", percentage=5)
+
+            # Step 1: Validate inputs
+            autodesk_file = getattr(getattr(params, "model", None), "autodesk_file", None)
+            if not autodesk_file:
+                raise vkt.UserError("Please select a Revit model in the 'Autodesk Model' section")
+            
+            selected_views = getattr(getattr(params, "export_ifc_section", None), "export_views", None) or []
+            if not selected_views:
+                raise vkt.UserError("Please select at least one view to export to IFC.")
+
+            project_id = getattr(autodesk_file, "project_id", None)
+            file_urn = getattr(autodesk_file, "urn", None)
+            
+            if not project_id or not file_urn:
+                raise vkt.UserError("Missing project id or URN for the selected Autodesk file.")
+            
+            vkt.UserMessage.info(f"Project ID: {project_id}")
+            
+            # Step 2: Detect Revit version from manifest
+            vkt.UserMessage.info("Detecting Revit version from model...")
+            try:
+                manifest = fetch_manifest(autodesk_file, access_token)
+                revit_version = get_revit_version_from_manifest(manifest)
+                if not revit_version:
+                    revit_version = DEFAULT_REVIT_VERSION
+                    vkt.UserMessage.info(f"Could not detect Revit version, using default: {revit_version}")
+                else:
+                    vkt.UserMessage.info(f"Detected Revit Version: {revit_version}")
+            except Exception as e:
+                revit_version = DEFAULT_REVIT_VERSION
+                vkt.UserMessage.info(f"Error detecting Revit version: {e}, using default: {revit_version}")
+            
+            # Step 3: Get the correct signature and activity alias for IFC export
+            signature, activity_full_alias = get_ifc_export_signature(revit_version)
+            vkt.UserMessage.info(f"Using IFC export activity: {activity_full_alias} for Revit {revit_version}")
+            
+            vkt.UserMessage.info("Resolving target folder from input file location...")
+            vkt.progress_message("Setting up Design Automation with ACC...", percentage=15)
+
+            # Step 4: Create input parameter for Revit file
+            vkt.UserMessage.info("Setting up input Revit file from ACC...")
+            input_revit = ActivityInputParameterAcc(
+                name="rvtFile",
+                localName="input.rvt",
+                verb="get",
+                description="Input Revit File for IFC export",
+                required=True,
+                is_engine_input=True,
+                project_id=project_id,
+                linage_urn=file_urn,
+            )
+            
+            # Step 5: Get folder ID from input file location
+            folder_id = parent_folder_from_item(
+                project_id=project_id, 
+                item_id=file_urn, 
+                token=access_token
+            )
+            vkt.UserMessage.info(f"Target folder resolved: {folder_id}")
+            vkt.progress_message("Preparing IFC export settings...", percentage=25)
+
+            # Step 6: Create IFC export configuration
+            vkt.UserMessage.info(f"Creating IFC export configuration for {len(selected_views)} view(s)...")
+            ifc_config = create_ifc_export_json(selected_views)
+            
+            input_json = ActivityJsonParameter(
+                name="ifcSettings",
+                file_name="ifc_settings.json",
+                localName="ifc_settings.json",
+                verb="get",
+                description="IFC Export Settings",
+            )
+            input_json.set_content(ifc_config)
+            vkt.progress_message("Uploading IFC configuration to ACC...", percentage=30)
+            
+            # Step 7: Create output parameter for ZIP file (stored in ACC)
+            version = autodesk_file.get_latest_version(access_token)
+            attrs = getattr(version, "attributes", {}) or {}
+            display_name = attrs.get("displayName", "model")
+            short_uuid = uuid.uuid4().hex[:8]
+            output_zip_filename = f"{display_name}_IFC_{short_uuid}.zip"
+            
+            output_zip = ActivityOutputParameterAcc(
+                name="result",
+                localName="result.zip",
+                verb="put",
+                description="Zipped IFC files",
+                folder_id=folder_id,
+                project_id=project_id,
+                file_name=output_zip_filename
+            )
+            
+            # Step 8: Create and execute work item
+            vkt.UserMessage.info("Creating IFC export work item...")
+            vkt.progress_message("Running IFC Export (this may take a few minutes)...", percentage=35)
+            
+            workitem = WorkItemAcc(
+                parameters=[input_revit, input_json, output_zip],
+                activity_full_alias=activity_full_alias
+            )
+            workitem_id = workitem.run_public_activity(
+                token3lo=access_token, 
+                activity_signature=signature
+            )
+            vkt.UserMessage.info(f"Workitem ID: {workitem_id}")
+
+            # Step 9: Poll workitem status
+            vkt.UserMessage.info("Polling workitem status...")
+            elapsed = 0
+            poll_interval = 10
+            max_wait = 600
+            final_status = None
+            report_url = None
+
+            while elapsed <= max_wait:
+                status_payload = get_workitem_status(workitem_id, access_token)
+                final_status = status_payload.get("status")
+                report_url = status_payload.get("reportUrl")
+                percentage = min(35 + int((elapsed / max_wait) * 55), 90)
+                vkt.progress_message(f"Work item status: {final_status} [{elapsed}s]...", percentage=percentage)
+                vkt.UserMessage.info(f"[{elapsed:3d}s] status = {final_status}")
+                if final_status in ("success", "failed", "cancelled"):
+                    break
+                time.sleep(poll_interval)
+                elapsed += poll_interval
+
+            if final_status != "success":
+                msg = f"IFC export did not finish with success. Status: {final_status}"
+                if report_url:
+                    msg += f"\nReport URL: {report_url}"
+                raise vkt.UserError(msg)
+
+            # Step 10: Create ACC Item for the output
+            vkt.UserMessage.info("IFC export completed successfully!")
+            vkt.progress_message("Creating ACC item for IFC output...", percentage=92)
+            output_zip.create_acc_item(token=access_token)
+            
+            vkt.progress_message("IFC export complete!", percentage=100)
+
+            success_msg = (
+                f"IFC Export completed successfully!\n\n"
+                f"Exported views: {len(selected_views)}\n"
+                f"- {', '.join(selected_views)}\n\n"
+                f"Output file: {output_zip_filename}\n"
+                f"Workitem ID: {workitem_id}\n"
+            )
+            if report_url:
+                success_msg += f"\nReport URL: {report_url}"
+
+            vkt.UserMessage.success(success_msg)
+
+        except vkt.UserError:
+            raise
+        except Exception as e:
+            import traceback
+            error_detail = traceback.format_exc()
+            raise vkt.UserError(f"Error in IFC Export workflow: {str(e)}\n\nDetails:\n{error_detail}")

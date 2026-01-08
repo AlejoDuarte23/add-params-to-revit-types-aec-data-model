@@ -1,3 +1,4 @@
 viktor==14.26.0
 requests
 aps-automation-sdk
+aps-viewer-sdk
