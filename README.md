@@ -1,5 +1,5 @@
 
-# Add Parameters to Revit Types (ACC Integration | Data Exchange API  )
+# Add Parameters to Revit Types and Export to IFC (ACC Integration | AEC Data Model API API  )
 A VIKTOR app that automates adding custom parameters to Revit model types and exporting to IFC format, using Autodesk Construction Cloud (ACC) and the Automation API.
 
 ## Features
